@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from "react";
 import { Button } from "@/app/components/ui/button";
 import { Input } from "@/app/components/ui/input";
 import { Alert, AlertDescription } from "@/app/components/ui/alert";
-import { ArrowLeft, Loader2, AlertCircle, Mail } from "lucide-react";
+import { ArrowLeft, Loader2, AlertCircle } from "lucide-react";
 import logo from "@/assets/1ba82f3a20d2d9c2e55dc299a173428eb2127875.png";
 import { useAuth } from "./auth-context";
 
@@ -136,14 +136,6 @@ export function OTPVerification({ onNavigate, onSuccess, mode, email, onResetVer
               }
             </p>
           </div>
-
-          {/* Demo Info */}
-          <Alert className="mb-6 border-amber-500/50 bg-amber-500/10">
-            <Mail className="h-4 w-4 text-amber-500" />
-            <AlertDescription className="text-amber-600 dark:text-amber-400 text-xs">
-              For demo purposes, use code: <strong>123456</strong>
-            </AlertDescription>
-          </Alert>
 
           {/* Error Alert */}
           {error && (

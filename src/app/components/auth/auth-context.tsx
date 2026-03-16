@@ -1,4 +1,4 @@
-import { registerUser, loginUser, sendOtp, verifyOtp } from "@/services/authService";
+import { registerUser, loginUser, sendOtp, verifyOtp, changePassword } from "@/services/authService";
 import { decodeToken, getRoleFromToken } from "@/utils/decodeToken";
 import React, { createContext, useContext, useState, useEffect, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
@@ -22,7 +22,7 @@ export interface User {
   email: string;
   name: string;
   role: UserRole;
-  accountType: AccountType;
+  accountType: AccountType;  
   accountId: string;
   organizationName?: string;
   /** Display label from API (e.g. role_name: "standard_owner") for header badge */
@@ -382,12 +382,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const resetPassword = async (email: string, newPassword: string) => {
-    // Simulate API call
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    // In production, update password in database
-    console.log("Password reset successful for:", email);
-    return { success: true };
+    try {
+      await changePassword({
+        email,
+        password: newPassword,
+        password_confirmation: newPassword,
+      });
+      return { success: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to reset password";
+      return { success: false, error: message };
+    }
   };
 
   return (

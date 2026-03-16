@@ -190,3 +190,60 @@ export async function verifyOtp(email: string, otp: string): Promise<VerifyOtpRe
 
   return body;
 }
+
+/** Request body for POST /api/change-pass */
+export interface ChangePassRequest {
+  email: string;
+  password: string;
+  password_confirmation: string;
+}
+
+/** Response from POST /api/change-pass */
+export interface ChangePassResponse {
+  status: string;
+  message: string;
+  data: {
+    id: number;
+    name: string;
+    email: string;
+    email_verified_at: string | null;
+    created_at: string;
+    updated_at: string;
+    otp: string;
+    otp_expires_at: string | null;
+    updated_by: number;
+    otp_verified: boolean;
+  };
+}
+
+/**
+ * Set new password after OTP verification (e.g. forgot-password flow).
+ * POST /api/change-pass with body { email, password, password_confirmation }.
+ */
+export async function changePassword(data: ChangePassRequest): Promise<ChangePassResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/change-pass`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      email: data.email,
+      password: data.password,
+      password_confirmation: data.password_confirmation,
+    }),
+  });
+
+  const body = (await response.json().catch(() => ({}))) as ChangePassResponse & { message?: string };
+
+  if (!response.ok) {
+    const message =
+      body.message || (body as { error?: string }).error || `Password change failed (${response.status})`;
+    throw new Error(message);
+  }
+
+  if (body.status !== "success") {
+    throw new Error(body.message || "Password change failed");
+  }
+
+  return body;
+}
