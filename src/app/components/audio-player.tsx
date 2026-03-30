@@ -95,13 +95,23 @@ export function AudioPlayer({ title, artist, audioUrl, artwork, onClose }: Audio
     return `${minutes}:${seconds.toString().padStart(2, "0")}`;
   };
 
+  const artworkIsImageUrl =
+    typeof artwork === "string" &&
+    (artwork.startsWith("http://") || artwork.startsWith("https://"));
+
   return (
     <Card className="border-[#ff0050]/20 bg-card/95 backdrop-blur">
       <CardContent className="p-3 sm:p-4">
         <div className="flex items-center gap-3 sm:gap-4">
           {/* Artwork */}
-          <div className="h-12 w-12 sm:h-16 sm:w-16 rounded-lg bg-gradient-to-br from-[#ff0050] to-[#cc0040] flex items-center justify-center text-xl sm:text-2xl flex-shrink-0">
-            {artwork || "🎵"}
+          <div className="h-12 w-12 sm:h-16 sm:w-16 rounded-lg flex-shrink-0 overflow-hidden border border-border bg-muted">
+            {artworkIsImageUrl ? (
+              <img src={artwork} alt="" className="h-full w-full object-cover" />
+            ) : (
+              <div className="h-full w-full bg-gradient-to-br from-[#ff0050] to-[#cc0040] flex items-center justify-center text-xl sm:text-2xl">
+                {artwork || "🎵"}
+              </div>
+            )}
           </div>
 
           {/* Player Controls */}

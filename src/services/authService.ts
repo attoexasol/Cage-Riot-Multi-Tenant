@@ -8,11 +8,13 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   access_token: string;
+  refresh_token?: string;
   token_type: string;
   organization_id: number;
   organization_parent_id: number | null;
   organization_name?: string;
   role_name?: string;
+  expires_in?: number;
 }
 
 export interface LoginRequest {
@@ -23,13 +25,52 @@ export interface LoginRequest {
 export interface LoginResponse {
   message?: string;
   access_token: string;
+  refresh_token?: string;
   token_type: string;
-  organization_id: number;
+  organization_id: number | string;
   organization_name?: string;
   role_name?: string;
   user_role?: string;
   role?: string;
   expires_in?: number;
+}
+
+/** POST /api/refresh */
+export interface RefreshTokenResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in?: number;
+}
+
+export async function refreshTokens(refreshToken: string): Promise<RefreshTokenResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/refresh`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+
+  const body = (await response.json().catch(() => ({}))) as RefreshTokenResponse & {
+    message?: string;
+    error?: string;
+  };
+
+  if (!response.ok) {
+    const message =
+      body.message || body.error || `Token refresh failed (${response.status})`;
+    throw new Error(message);
+  }
+
+  if (!body.access_token) {
+    throw new Error("No access token in refresh response");
+  }
+
+  return {
+    access_token: body.access_token,
+    refresh_token: body.refresh_token ?? refreshToken,
+    expires_in: body.expires_in ?? 3600,
+  };
 }
 
 /**

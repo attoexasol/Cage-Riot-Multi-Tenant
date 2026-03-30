@@ -1,4 +1,6 @@
 import { registerUser, loginUser, sendOtp, verifyOtp, changePassword } from "@/services/authService";
+import { SESSION_EXPIRED_EVENT } from "@/services/sessionEvents";
+import { persistAuthTokens, clearAuthTokens } from "@/services/tokenStorage";
 import { decodeToken, getRoleFromToken } from "@/utils/decodeToken";
 import React, { createContext, useContext, useState, useEffect, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
@@ -208,6 +210,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  useEffect(() => {
+    const onSessionExpired = () => {
+      setUser(null);
+      setPendingUser(null);
+      localStorage.removeItem("auth_user");
+      localStorage.removeItem("organization_id");
+      localStorage.removeItem("organization_name");
+      localStorage.removeItem("user_role");
+      navigate("/signin", { replace: true });
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onSessionExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onSessionExpired);
+  }, [navigate]);
+
   // const login = async (email: string, password: string) => {
   //   // Simulate API call
   //   await new Promise(resolve => setTimeout(resolve, 500));
@@ -260,7 +276,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return { success: false, error: "Token not received" };
       }
 
-      localStorage.setItem("access_token", token);
+      persistAuthTokens({
+        access_token: token,
+        refresh_token: response.refresh_token,
+        expires_in: response.expires_in ?? 3600,
+      });
       if (response.organization_id != null) {
         localStorage.setItem("organization_id", String(response.organization_id));
       }
@@ -317,7 +337,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return { success: false, error: "Token not received" };
       }
 
-      localStorage.setItem("access_token", token);
+      persistAuthTokens({
+        access_token: token,
+        refresh_token: response.refresh_token,
+        expires_in: response.expires_in ?? 3600,
+      });
       if (response.organization_id != null) {
         localStorage.setItem("organization_id", String(response.organization_id));
       }
@@ -354,7 +378,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
     setPendingUser(null);
     localStorage.removeItem("auth_user");
-    localStorage.removeItem("access_token");
+    clearAuthTokens();
     localStorage.removeItem("organization_id");
     localStorage.removeItem("organization_name");
     localStorage.removeItem("user_role");

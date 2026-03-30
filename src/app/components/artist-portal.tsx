@@ -37,6 +37,7 @@ import { RoleBadge } from "@/app/components/ui/role-badge";
 import logo from "@/assets/1ba82f3a20d2d9c2e55dc299a173428eb2127875.png";
 import { AnalyticsView } from "@/app/components/analytics-view";
 import { ReleasesView } from "@/app/components/releases-view";
+import { UploadContent } from "@/app/components/upload-content";
 import {
   Card,
   CardContent,
@@ -97,6 +98,7 @@ interface Notification {
 const menuItems = [
   { id: "dashboard", label: "Dashboard", icon: Music, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
   { id: "releases", label: "Releases", icon: Music, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
+  { id: "upload", label: "Upload", icon: Upload, roles: ["artist-owner", "account-owner"] },
   { id: "analytics", label: "Analytics", icon: BarChart3, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
   { id: "royalties", label: "Royalties", icon: Wallet, roles: ["artist-owner", "account-owner"] },
   { id: "team", label: "Team", icon: Users, roles: ["artist-owner", "account-owner"] },
@@ -110,6 +112,8 @@ export function ArtistPortal() {
   const navigate = useNavigate();
   const activeTab = tabParam && VALID_TABS.has(tabParam) ? tabParam : "dashboard";
   const setActiveTab = (id: string) => navigate(`/artist/${id}`);
+  /** When set, Upload tab loads this release for editing (PUT). Cleared for a new upload. */
+  const [editReleaseId, setEditReleaseId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [is2FAEnabled, set2FAEnabled] = useState(true);
@@ -969,7 +973,25 @@ export function ArtistPortal() {
       case "dashboard":
         return renderDashboard();
       case "releases":
-        return <ReleasesView onNavigateToUpload={() => { }} />;
+        return (
+          <ReleasesView
+            onNavigateToUpload={() => {
+              setEditReleaseId(null);
+              setActiveTab("upload");
+            }}
+            onEditRelease={(id) => {
+              setEditReleaseId(id);
+              setActiveTab("upload");
+            }}
+          />
+        );
+      case "upload":
+        return (
+          <UploadContent
+            editReleaseId={editReleaseId}
+            onEditConsumed={() => setEditReleaseId(null)}
+          />
+        );
       case "analytics":
         return renderAnalytics();
       case "royalties":
@@ -1020,7 +1042,10 @@ export function ArtistPortal() {
             return (
               <button
                 key={item.id}
-                onClick={() => setActiveTab(item.id)}
+                onClick={() => {
+                  if (item.id === "upload") setEditReleaseId(null);
+                  setActiveTab(item.id);
+                }}
                 className={cn(
                   "w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors",
                   isActive
@@ -1376,7 +1401,7 @@ export function ArtistPortal() {
                 onClick={() => setInviteUserModalOpen(false)}
               >
                 Cancel
-              </Button>
+              </Button>    
               <Button
                 type="submit"
                 className="bg-[#ff0050] hover:bg-[#cc0040]"
@@ -1415,6 +1440,7 @@ export function ArtistPortal() {
                 <button
                   key={item.id}
                   onClick={() => {
+                    if (item.id === "upload") setEditReleaseId(null);
                     setActiveTab(item.id);
                     setMobileMenuOpen(false);
                   }}
@@ -1466,6 +1492,7 @@ export function ArtistPortal() {
     </div>
   );
 }
+
 
 
 

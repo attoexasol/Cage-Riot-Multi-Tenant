@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Card, CardContent } from "@/app/components/ui/card";
 import { Button } from "@/app/components/ui/button";
 import { Badge } from "@/app/components/ui/badge";
@@ -6,8 +6,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/app/components/ui/ta
 import {
   ArrowLeft,
   Music,
-  Image as ImageIcon,
-  FileText,
   DollarSign,
   Radio,
   Sparkles,
@@ -17,6 +15,7 @@ import {
   Calendar,
   User,
   Globe,
+  FileText,
 } from "lucide-react";
 import { WorkflowStatus } from "@/app/components/workflow-status";
 import { QCValidation } from "@/app/components/qc-validation";
@@ -24,53 +23,115 @@ import { RoyaltySplits } from "@/app/components/royalty-splits";
 import { SampleLicenses } from "@/app/components/sample-licenses";
 import { MarketingFields } from "@/app/components/marketing-fields";
 import { DistributionStatus } from "@/app/components/distribution-status";
+import { getRelease, normalizeReleaseMetadata, type ReleaseListItem } from "@/services/releaseService";
+import {
+  artworkEmojiForId,
+  formatReleaseDisplayDate,
+  releaseArtworkUrlFromFilePath,
+} from "@/lib/releaseFormat";
+import { toast } from "sonner";
 
 interface ReleaseInspectorProps {
   releaseId: string;
   onBack?: () => void;
 }
 
+/** Placeholder tracks — replace when track API is available. */
+const MOCK_TRACKS = [
+  {
+    id: "1",
+    title: "Summer Nights",
+    duration: "3:24",
+    isrc: "USUM72345678",
+    explicit: false,
+  },
+  {
+    id: "2",
+    title: "Summer Nights (Extended Mix)",
+    duration: "5:47",
+    isrc: "USUM72345679",
+    explicit: false,
+  },
+];
+
+function formatReleaseTypeLabel(apiType: string | null | undefined): string {
+  const t = (apiType || "").toLowerCase();
+  if (t === "ep") return "EP";
+  if (t === "single") return "Single";
+  if (t === "album") return "Album";
+  if (!apiType?.trim()) return "—";
+  return apiType.charAt(0).toUpperCase() + apiType.slice(1).toLowerCase();
+}
+
+function resolveArtworkUrl(assetId: string | null | undefined): string | null {
+  if (assetId == null) return null;
+  const s = String(assetId).trim();
+  if (!s) return null;
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+  return null;
+}
+
+type WorkflowStage =
+  | "draft"
+  | "qc"
+  | "legal"
+  | "approved"
+  | "queued"
+  | "sent"
+  | "ingested"
+  | "live"
+  | "rejected";
+
+const WORKFLOW_STAGES: readonly string[] = [
+  "draft",
+  "qc",
+  "legal",
+  "approved",
+  "queued",
+  "sent",
+  "ingested",
+  "live",
+  "rejected",
+];
+
+function toWorkflowStage(status: string | null | undefined): WorkflowStage {
+  const v = (status || "draft").toLowerCase();
+  return (WORKFLOW_STAGES.includes(v) ? v : "draft") as WorkflowStage;
+}
+
 export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
   const [activeTab, setActiveTab] = useState("overview");
+  const [detail, setDetail] = useState<ReleaseListItem | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  // Mock release data
-  const release = {
-    id: releaseId,
-    title: "Summer Nights",
-    artist: "The Waves",
-    artwork: "https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=500&h=500&fit=crop",
-    upc: "123456789012",
-    releaseDate: "2026-02-15",
-    releaseType: "Single",
-    label: "Ocean Records",
-    genre: "Electronic",
-    language: "English",
-    status: "approved" as const,
-    copyrightYear: 2026,
-    copyrightHolder: "Ocean Records",
-    description: "A dreamy electronic single perfect for summer vibes",
-    tracks: [
-      {
-        id: "1",
-        title: "Summer Nights",
-        duration: "3:24",
-        isrc: "USUM72345678",
-        explicit: false,
-      },
-      {
-        id: "2",
-        title: "Summer Nights (Extended Mix)",
-        duration: "5:47",
-        isrc: "USUM72345679",
-        explicit: false,
-      },
-    ],
-    createdAt: new Date("2026-01-15"),
-    updatedAt: new Date("2026-01-28"),
-    createdBy: "The Waves",
-    approvedBy: "Admin",
-    approvedAt: new Date("2026-01-20"),
-  };
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await getRelease(releaseId);
+        if (!cancelled) {
+          setDetail(data);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setDetail(null);
+          const message = err instanceof Error ? err.message : "Failed to load release";
+          setError(message);
+          toast.error(message);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [releaseId]);
 
   const getStatusBadge = (status: string) => {
     const variants: Record<string, { className: string; label: string; icon: React.ReactNode }> = {
@@ -106,7 +167,15 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
       },
     };
 
-    const variant = variants[status] || variants.draft;
+    const key = status.toLowerCase();
+    const variant = variants[key];
+    if (!variant) {
+      return (
+        <Badge variant="secondary" className="capitalize">
+          {status || "Unknown"}
+        </Badge>
+      );
+    }
 
     return (
       <Badge variant="secondary" className={variant.className}>
@@ -116,14 +185,85 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
     );
   };
 
+  if (loading) {
+    return (
+      <div className="space-y-4 sm:space-y-6 px-3.5 sm:px-[15px] pt-4 sm:pt-[30px]">
+        <div className="flex items-center gap-4">
+          {onBack && (
+            <Button
+              variant="outline"
+              size="icon"
+              className="hover:bg-[#ff0050]/10 hover:border-[#ff0050]/50 hover:text-[#ff0050] transition-all flex-shrink-0"
+              onClick={onBack}
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+          )}
+          <p className="text-sm text-muted-foreground">Loading release…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !detail) {
+    return (
+      <div className="space-y-4 sm:space-y-6 px-3.5 sm:px-[15px] pt-4 sm:pt-[30px]">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+          {onBack && (
+            <Button
+              variant="outline"
+              size="icon"
+              className="hover:bg-[#ff0050]/10 hover:border-[#ff0050]/50 hover:text-[#ff0050] transition-all flex-shrink-0"
+              onClick={onBack}
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+          )}
+          <p className="text-sm text-destructive">{error || "Release not found."}</p>
+        </div>
+      </div>
+    );
+  }
+
+  const meta = normalizeReleaseMetadata(detail.metadata);
+  const hasReleaseMetadata = Object.values(meta).some(
+    (v) => String(v ?? "").trim().length > 0
+  );
+  const title = detail.title?.trim() || "Untitled";
+  const artist = detail.primary_artist_name?.trim() || "—";
+  const releaseTypeLabel = formatReleaseTypeLabel(detail.release_type);
+  const upc = detail.upc?.trim() || "—";
+  const releaseDateStr = formatReleaseDisplayDate(detail.release_date) || "—";
+  const labelName = detail.label_name?.trim() || "—";
+  const statusRaw = detail.status?.trim() || "draft";
+  const pathUrl = releaseArtworkUrlFromFilePath(detail.artwork?.file_path);
+  const artworkUrl = pathUrl ?? resolveArtworkUrl(detail.artwork_asset_id);
+  const emoji = artworkEmojiForId(detail.id || releaseId);
+
+  const metadataEntries = Object.entries(meta)
+    .filter(([, v]) => String(v ?? "").trim().length > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+
+  const createdByDisplay =
+    detail.created_by != null ? String(detail.created_by) : "—";
+  const createdAtStr = formatReleaseDisplayDate(detail.created_at) || "—";
+  const updatedAtStr = formatReleaseDisplayDate(detail.updated_at) || "—";
+  const idDisplay = detail.id || releaseId;
+
+  const workflowStage = toWorkflowStage(statusRaw);
+
+  const versionTitleDisplay = detail.version_title?.trim() || "—";
+  const originalReleaseDateStr =
+    formatReleaseDisplayDate(detail.original_release_date) || "—";
+
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row items-start gap-4 sm:gap-6 pt-4 sm:pt-[30px] px-3.5 sm:px-[15px] pb-3 sm:pb-[15px]">
         {onBack && (
-          <Button 
-            variant="outline" 
-            size="icon" 
+          <Button
+            variant="outline"
+            size="icon"
             className="hover:bg-[#ff0050]/10 hover:border-[#ff0050]/50 hover:text-[#ff0050] transition-all flex-shrink-0"
             onClick={onBack}
           >
@@ -136,72 +276,62 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
             {/* Artwork */}
             <div className="relative group flex-shrink-0 mx-auto sm:mx-0">
               <div className="h-32 w-32 sm:h-40 sm:w-40 rounded-2xl overflow-hidden border-2 border-border shadow-lg hover:shadow-xl transition-all">
-                <img
-                  src={release.artwork}
-                  alt={release.title}
-                  className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                />
+                {artworkUrl ? (
+                  <img
+                    src={artworkUrl}
+                    alt={title}
+                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                  />
+                ) : (
+                  <div className="w-full h-full bg-gradient-to-br from-[#ff0050] to-[#cc0040] flex items-center justify-center text-4xl sm:text-5xl select-none">
+                    {emoji}
+                  </div>
+                )}
               </div>
-              <div className="absolute inset-0 rounded-2xl bg-gradient-to-t from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+              <div className="absolute inset-0 rounded-2xl bg-gradient-to-t from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
             </div>
 
             {/* Info */}
             <div className="flex-1 space-y-3 sm:space-y-5 w-full">
               <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 sm:gap-4">
                 <div className="flex-1 text-center sm:text-left">
-                  <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold tracking-tight mb-2">{release.title}</h1>
+                  <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold tracking-tight mb-2">{title}</h1>
                   <div className="flex items-center justify-center sm:justify-start gap-2 text-base sm:text-lg text-muted-foreground">
                     <User className="h-4 w-4" />
-                    <p>{release.artist}</p>
+                    <p>{artist}</p>
                   </div>
                 </div>
-                <div className="flex-shrink-0 flex justify-center sm:block">
-                  {getStatusBadge(release.status)}
-                </div>
+                <div className="flex-shrink-0 flex justify-center sm:block">{getStatusBadge(statusRaw)}</div>
               </div>
 
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-4">
                 <div className="p-3 sm:p-4 rounded-xl border bg-card/50 backdrop-blur-sm hover:border-[#ff0050]/30 transition-all">
-                  <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1 sm:mb-2">Release Type</p>
-                  <p className="text-xs sm:text-sm font-semibold">{release.releaseType}</p>
+                  <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1 sm:mb-2">
+                    Release Type
+                  </p>
+                  <p className="text-xs sm:text-sm font-semibold">{releaseTypeLabel}</p>
                 </div>
                 <div className="p-3 sm:p-4 rounded-xl border bg-card/50 backdrop-blur-sm hover:border-[#ff0050]/30 transition-all">
                   <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1 sm:mb-2">UPC</p>
-                  <p className="text-xs sm:text-sm font-semibold font-mono truncate">{release.upc}</p>
+                  <p className="text-xs sm:text-sm font-semibold font-mono truncate">{upc}</p>
                 </div>
                 <div className="p-3 sm:p-4 rounded-xl border bg-card/50 backdrop-blur-sm hover:border-[#ff0050]/30 transition-all">
-                  <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1 sm:mb-2">Release Date</p>
+                  <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1 sm:mb-2">
+                    Release Date
+                  </p>
                   <p className="text-xs sm:text-sm font-semibold flex items-center gap-1 sm:gap-2">
                     <Calendar className="h-3 sm:h-3.5 w-3 sm:w-3.5 text-[#ff0050] flex-shrink-0" />
-                    <span className="truncate">{new Date(release.releaseDate).toLocaleDateString()}</span>
+                    <span className="truncate">{releaseDateStr}</span>
                   </p>
                 </div>
                 <div className="p-3 sm:p-4 rounded-xl border bg-card/50 backdrop-blur-sm hover:border-[#ff0050]/30 transition-all">
                   <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1 sm:mb-2">Label</p>
                   <p className="text-xs sm:text-sm font-semibold flex items-center gap-1 sm:gap-2">
                     <Globe className="h-3 sm:h-3.5 w-3 sm:w-3.5 text-[#ff0050] flex-shrink-0" />
-                    <span className="truncate">{release.label}</span>
+                    <span className="truncate">{labelName}</span>
                   </p>
                 </div>
               </div>
-
-              {release.approvedBy && release.approvedAt && (
-                <div className="p-3 sm:p-4 rounded-xl bg-gradient-to-r from-green-500/10 to-emerald-500/10 border border-green-500/30 shadow-sm">
-                  <div className="flex items-center gap-2 sm:gap-3">
-                    <div className="flex-shrink-0 w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-green-500/20 flex items-center justify-center">
-                      <CheckCircle2 className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-green-500" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs sm:text-sm font-semibold text-green-600 dark:text-green-400">
-                        Approved by {release.approvedBy}
-                      </p>
-                      <p className="text-[10px] sm:text-xs text-muted-foreground mt-0.5">
-                        {release.approvedAt.toLocaleDateString()} at {release.approvedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              )}
             </div>
           </div>
         </div>
@@ -241,40 +371,54 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
         </TabsList>
 
         <TabsContent value="overview" className="space-y-4 sm:space-y-6 mt-4 sm:mt-6">
-          {/* Release Details */}
           <Card>
             <CardContent className="pt-4 sm:pt-6 px-3 sm:px-6">
               <div className="space-y-4 sm:space-y-6">
                 <div>
                   <h3 className="font-semibold mb-2 sm:mb-3 text-sm sm:text-base">Release Information</h3>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
-                    <div>
-                      <p className="text-xs sm:text-sm text-muted-foreground">Genre</p>
-                      <p className="font-medium text-sm sm:text-base">{release.genre}</p>
+                  {hasReleaseMetadata ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
+                      {metadataEntries.map(([key, value]) => (
+                        <div key={key}>
+                          <p className="text-xs sm:text-sm text-muted-foreground">{key}</p>
+                          <p className="font-medium text-sm sm:text-base break-words">
+                            {String(value).trim()}
+                          </p>
+                        </div>
+                      ))}
                     </div>
-                    <div>
-                      <p className="text-xs sm:text-sm text-muted-foreground">Language</p>
-                      <p className="font-medium text-sm sm:text-base">{release.language}</p>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
+                      <div>
+                        <p className="text-xs sm:text-sm text-muted-foreground">Primary artist name</p>
+                        <p className="font-medium text-sm sm:text-base">{artist}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs sm:text-sm text-muted-foreground">Version title</p>
+                        <p className="font-medium text-sm sm:text-base">{versionTitleDisplay}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs sm:text-sm text-muted-foreground">Original release date</p>
+                        <p className="font-medium text-sm sm:text-base flex items-center gap-1 sm:gap-2">
+                          <Calendar className="h-3.5 w-3.5 text-[#ff0050] flex-shrink-0" />
+                          <span>{originalReleaseDateStr}</span>
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-xs sm:text-sm text-muted-foreground">Label name</p>
+                        <p className="font-medium text-sm sm:text-base flex items-center gap-1 sm:gap-2">
+                          <Globe className="h-3.5 w-3.5 text-[#ff0050] flex-shrink-0" />
+                          <span className="truncate">{labelName}</span>
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <p className="text-xs sm:text-sm text-muted-foreground">Copyright Year</p>
-                      <p className="font-medium text-sm sm:text-base">℗ {release.copyrightYear}</p>
-                    </div>
-                    <div>
-                      <p className="text-xs sm:text-sm text-muted-foreground">Copyright Holder</p>
-                      <p className="font-medium text-sm sm:text-base">{release.copyrightHolder}</p>
-                    </div>
-                    <div className="sm:col-span-2">
-                      <p className="text-xs sm:text-sm text-muted-foreground">Description</p>
-                      <p className="font-medium text-sm sm:text-base">{release.description}</p>
-                    </div>
-                  </div>
+                  )}
                 </div>
 
                 <div>
-                  <h3 className="font-semibold mb-2 sm:mb-3 text-sm sm:text-base">Tracks ({release.tracks.length})</h3>
+                  <h3 className="font-semibold mb-2 sm:mb-3 text-sm sm:text-base">Tracks ({MOCK_TRACKS.length})</h3>
                   <div className="space-y-2">
-                    {release.tracks.map((track, index) => (
+                    {MOCK_TRACKS.map((track, index) => (
                       <div
                         key={track.id}
                         className="flex items-center gap-2 sm:gap-4 p-2.5 sm:p-3 rounded-lg border"
@@ -302,26 +446,22 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
                     <div className="flex items-center gap-2">
                       <User className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground flex-shrink-0" />
                       <span className="text-muted-foreground">Created by:</span>
-                      <span className="font-medium truncate">{release.createdBy}</span>
+                      <span className="font-medium truncate">{createdByDisplay}</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <Calendar className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground flex-shrink-0" />
                       <span className="text-muted-foreground">Created:</span>
-                      <span className="font-medium truncate">
-                        {release.createdAt.toLocaleDateString()}
-                      </span>
+                      <span className="font-medium truncate">{createdAtStr}</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <Calendar className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground flex-shrink-0" />
                       <span className="text-muted-foreground">Last updated:</span>
-                      <span className="font-medium truncate">
-                        {release.updatedAt.toLocaleDateString()}
-                      </span>
+                      <span className="font-medium truncate">{updatedAtStr}</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <Globe className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground flex-shrink-0" />
                       <span className="text-muted-foreground">Release ID:</span>
-                      <span className="font-medium font-mono text-[10px] sm:text-xs truncate">{release.id}</span>
+                      <span className="font-medium font-mono text-[10px] sm:text-xs truncate">{idDisplay}</span>
                     </div>
                   </div>
                 </div>
@@ -331,23 +471,23 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
         </TabsContent>
 
         <TabsContent value="workflow" className="mt-6">
-          <WorkflowStatus currentStage={release.status} releaseId={release.id} />
+          <WorkflowStatus currentStage={workflowStage} releaseId={idDisplay} />
         </TabsContent>
 
         <TabsContent value="qc" className="mt-6">
-          <QCValidation releaseId={release.id} />
+          <QCValidation releaseId={idDisplay} />
         </TabsContent>
 
         <TabsContent value="splits" className="mt-6">
-          <RoyaltySplits releaseId={release.id} level="release" />
+          <RoyaltySplits releaseId={idDisplay} level="release" />
         </TabsContent>
 
         <TabsContent value="licenses" className="mt-6">
-          <SampleLicenses releaseId={release.id} />
+          <SampleLicenses releaseId={idDisplay} />
         </TabsContent>
 
         <TabsContent value="marketing" className="mt-6">
-          <MarketingFields releaseId={release.id} />
+          <MarketingFields releaseId={idDisplay} />
         </TabsContent>
 
         <TabsContent value="distribution" className="mt-6">
