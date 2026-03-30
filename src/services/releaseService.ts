@@ -284,6 +284,119 @@ export async function getRelease(id: string): Promise<ReleaseListItem> {
   return coerceReleaseDetailPayload(payload);
 }
 
+/** Nested asset on GET /api/releases/:id/tracks items. */
+export interface TrackAssetInfo {
+  id?: string;
+  asset_type?: string | null;
+  file_name?: string | null;
+  file_path?: string | null;
+  mime_type?: string | null;
+  file_size?: number;
+  track_id?: string | null;
+  release_id?: string | null;
+  organization_id?: string | null;
+  created_by?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ReleaseTrackItem {
+  id: string;
+  title?: string | null;
+  release_id?: string | null;
+  organization_id?: string | null;
+  track_number?: number | null;
+  created_by?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  audio?: TrackAssetInfo | null;
+  artwork?: TrackAssetInfo | null;
+}
+
+/** Laravel: raw array, `{ data: [...] }`, or paginator `{ data: { data: [...] } }`. */
+function extractReleaseTracksRows(json: unknown): unknown[] {
+  if (Array.isArray(json)) {
+    return json;
+  }
+  if (!json || typeof json !== "object") {
+    return [];
+  }
+  const o = json as Record<string, unknown>;
+  const top = o.data ?? o.tracks;
+  if (Array.isArray(top)) {
+    return top;
+  }
+  if (top && typeof top === "object" && !Array.isArray(top)) {
+    const nested = (top as Record<string, unknown>).data;
+    if (Array.isArray(nested)) {
+      return nested;
+    }
+  }
+  return [];
+}
+
+function normalizeReleaseTrackRow(raw: unknown): ReleaseTrackItem | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const row = raw as Record<string, unknown>;
+  const idVal = row.id ?? row.uuid;
+  if (idVal == null) {
+    return null;
+  }
+  const id = String(idVal).trim();
+  if (!id) {
+    return null;
+  }
+  return { ...row, id } as ReleaseTrackItem;
+}
+
+function parseReleaseTracksList(json: unknown): ReleaseTrackItem[] {
+  return extractReleaseTracksRows(json)
+    .map(normalizeReleaseTrackRow)
+    .filter((r): r is ReleaseTrackItem => r != null)
+    .sort((a, b) => (a.track_number ?? 9999) - (b.track_number ?? 9999));
+}
+
+async function doListReleaseTracks(accessToken: string, releaseId: string): Promise<Response> {
+  const rid = releaseId.trim();
+  return fetch(`${API_BASE_URL}/api/releases/${encodeURIComponent(rid)}/tracks`, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+}
+
+/**
+ * GET /api/releases/:releaseId/tracks — Bearer token; refreshes on 401 once.
+ */
+export async function listReleaseTracks(releaseId: string): Promise<ReleaseTrackItem[]> {
+  const rid = releaseId.trim();
+  if (!rid) {
+    throw new Error("Release id is required to load tracks");
+  }
+  let token = await getValidAccessToken();
+  let response = await doListReleaseTracks(token, rid);
+
+  if (response.status === 401) {
+    token = await recoverAccessTokenAfterUnauthorized();
+    response = await doListReleaseTracks(token, rid);
+  }
+
+  const json = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const body = (json || {}) as { message?: string; error?: string };
+    const message =
+      body.message || body.error || `Failed to load tracks (${response.status})`;
+    throw new Error(message);
+  }
+
+  return parseReleaseTracksList(json);
+}
+
 async function doCreateRelease(accessToken: string, formData: FormData): Promise<Response> {
   return fetch(`${API_BASE_URL}/api/releases`, {
     method: "POST",
@@ -457,7 +570,8 @@ export async function uploadReleaseArtwork(
 }
 
 /**
- * POST /api/releases/:releaseId/tracks — multipart: `title`, `track_number`, optional `audio`, `artwork`.
+ * POST /api/releases/:releaseId/tracks — multipart: `title`, `track_number`, `audio`, optional `artwork`.
+ * Matches API validation (audio required on create).
  */
 export interface CreateTrackMultipartPayload {
   title: string;
@@ -491,21 +605,109 @@ export function buildTrackFormData(payload: CreateTrackMultipartPayload): FormDa
   return fd;
 }
 
-function parseCreateTrackResponse(json: unknown): CreateTrackResponse {
+/** POST /api/tracks/:trackId/asset — multipart `audio` and/or `artwork`. */
+export interface UploadTrackAssetPayload {
+  audioFile?: File | null;
+  artworkFile?: File | null;
+}
+
+export function buildTrackAssetFormData(payload: UploadTrackAssetPayload): FormData {
+  const fd = new FormData();
+  if (payload.audioFile) {
+    fd.append("audio", payload.audioFile);
+  }
+  if (payload.artworkFile) {
+    fd.append("artwork", payload.artworkFile);
+  }
+  return fd;
+}
+
+export interface UploadTrackAssetResponse {
+  message?: string;
+  audio?: unknown;
+  artwork?: unknown;
+}
+
+function parseUploadTrackAssetResponse(json: unknown): UploadTrackAssetResponse {
   const root = (json || {}) as Record<string, unknown>;
   const msg = root.message as string | undefined;
   const data = root.data;
   if (data && typeof data === "object") {
+    return { ...(data as UploadTrackAssetResponse), message: msg };
+  }
+  return { ...(json as UploadTrackAssetResponse), message: msg };
+}
+
+async function doUploadTrackAsset(
+  accessToken: string,
+  trackId: string,
+  formData: FormData
+): Promise<Response> {
+  const tid = trackId.trim();
+  return fetch(`${API_BASE_URL}/api/tracks/${encodeURIComponent(tid)}/asset`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: formData,
+  });
+}
+
+/**
+ * POST /api/tracks/:trackId/asset — form fields `audio`, `artwork` (multipart). At least one file required by caller.
+ */
+export async function uploadTrackAsset(
+  trackId: string,
+  payload: UploadTrackAssetPayload
+): Promise<UploadTrackAssetResponse> {
+  const tid = trackId.trim();
+  if (!tid) {
+    throw new Error("Track id is required to upload track assets");
+  }
+  if (!payload.audioFile && !payload.artworkFile) {
+    return {};
+  }
+  const run = () => buildTrackAssetFormData(payload);
+  let token = await getValidAccessToken();
+  let response = await doUploadTrackAsset(token, tid, run());
+
+  if (response.status === 401) {
+    token = await recoverAccessTokenAfterUnauthorized();
+    response = await doUploadTrackAsset(token, tid, run());
+  }
+
+  const json = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const err = (json || {}) as { message?: string; error?: string };
+    throw new Error(err.message || err.error || `Track asset upload failed (${response.status})`);
+  }
+
+  return parseUploadTrackAssetResponse(json);
+}
+
+function parseCreateTrackResponse(json: unknown): CreateTrackResponse {
+  const root = (json || {}) as Record<string, unknown>;
+  const msg = root.message as string | undefined;
+  let body: Record<string, unknown> = root;
+  const data = root.data;
+  if (data && typeof data === "object") {
     const d = data as Record<string, unknown>;
     if (d.track && typeof d.track === "object") {
-      return { ...(d.track as CreateTrackResponse), message: msg };
+      body = d.track as Record<string, unknown>;
+    } else {
+      body = d;
     }
-    return { ...(data as CreateTrackResponse), message: msg };
+  } else if (root.track && typeof root.track === "object") {
+    body = root.track as Record<string, unknown>;
   }
-  if (root.track && typeof root.track === "object") {
-    return { ...(root.track as CreateTrackResponse), message: msg };
-  }
-  return { ...(json as CreateTrackResponse), message: msg };
+  const idVal = body.id ?? body.uuid;
+  return {
+    ...(body as unknown as CreateTrackResponse),
+    id: idVal != null ? String(idVal).trim() : undefined,
+    message: msg,
+  };
 }
 
 async function doCreateReleaseTrack(
@@ -546,8 +748,17 @@ export async function createReleaseTrack(
   const json = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    const err = (json || {}) as { message?: string; error?: string };
-    throw new Error(err.message || err.error || `Create track failed (${response.status})`);
+    const err = (json || {}) as {
+      message?: string;
+      error?: string;
+      errors?: Record<string, string[]>;
+    };
+    let msg = err.message || err.error || `Create track failed (${response.status})`;
+    if (err.errors && typeof err.errors === "object") {
+      const first = Object.values(err.errors).flat()[0];
+      if (first) msg = first;
+    }
+    throw new Error(msg);
   }
 
   return parseCreateTrackResponse(json);

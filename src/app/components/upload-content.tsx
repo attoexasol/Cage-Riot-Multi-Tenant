@@ -94,9 +94,23 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+const AUDIO_EXT = new Set([
+  "wav",
+  "mp3",
+  "flac",
+  "m4a",
+  "aac",
+  "ogg",
+  "aiff",
+  "aif",
+  "webm",
+]);
+
 function fileToUploadType(file: File): UploadFile["type"] {
   const t = file.type;
   if (t.startsWith("audio/")) return "audio";
+  const ext = file.name.split(".").pop()?.toLowerCase();
+  if (ext && AUDIO_EXT.has(ext)) return "audio";
   if (t.startsWith("video/")) return "video";
   if (t.startsWith("image/")) return "image";
   return "document";
@@ -106,7 +120,13 @@ function pickAudioFileForTrack(track: Track): File | null {
   const a = track.files.find((f) => f.type === "audio" && f.file);
   if (a?.file) return a.file;
   const v = track.files.find((f) => f.type === "video" && f.file);
-  return v?.file ?? null;
+  if (v?.file) return v.file;
+  const byExt = track.files.find((f) => {
+    if (!f.file) return false;
+    const ext = f.file.name.split(".").pop()?.toLowerCase();
+    return ext != null && AUDIO_EXT.has(ext);
+  });
+  return byExt?.file ?? null;
 }
 
 function pickArtworkFileForTrack(track: Track): File | null {
@@ -482,11 +502,18 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
           for (let i = 0; i < metadata.tracks.length; i++) {
             const t = metadata.tracks[i];
             if (!t.title.trim()) continue;
+            const audioF = pickAudioFileForTrack(t);
+            const artF = pickArtworkFileForTrack(t);
+            if (!audioF) {
+              throw new Error(
+                `Track "${t.title.trim()}" needs an audio file (same as Postman: multipart field "audio").`
+              );
+            }
             await createReleaseTrack(newReleaseId, {
               title: t.title,
               track_number: i + 1,
-              audioFile: pickAudioFileForTrack(t),
-              artworkFile: pickArtworkFileForTrack(t),
+              audioFile: audioF,
+              artworkFile: artF,
             });
           }
         } else if (hasTracksToSave && !newReleaseId) {

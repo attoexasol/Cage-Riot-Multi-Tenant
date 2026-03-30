@@ -16,6 +16,7 @@ import {
   User,
   Globe,
   FileText,
+  PlayCircle,
 } from "lucide-react";
 import { WorkflowStatus } from "@/app/components/workflow-status";
 import { QCValidation } from "@/app/components/qc-validation";
@@ -23,7 +24,14 @@ import { RoyaltySplits } from "@/app/components/royalty-splits";
 import { SampleLicenses } from "@/app/components/sample-licenses";
 import { MarketingFields } from "@/app/components/marketing-fields";
 import { DistributionStatus } from "@/app/components/distribution-status";
-import { getRelease, normalizeReleaseMetadata, type ReleaseListItem } from "@/services/releaseService";
+import {
+  getRelease,
+  listReleaseTracks,
+  normalizeReleaseMetadata,
+  type ReleaseListItem,
+  type ReleaseTrackItem,
+} from "@/services/releaseService";
+import { AudioPlayer } from "@/app/components/audio-player";
 import {
   artworkEmojiForId,
   formatReleaseDisplayDate,
@@ -36,23 +44,24 @@ interface ReleaseInspectorProps {
   onBack?: () => void;
 }
 
-/** Placeholder tracks — replace when track API is available. */
-const MOCK_TRACKS = [
-  {
-    id: "1",
-    title: "Summer Nights",
-    duration: "3:24",
-    isrc: "USUM72345678",
-    explicit: false,
-  },
-  {
-    id: "2",
-    title: "Summer Nights (Extended Mix)",
-    duration: "5:47",
-    isrc: "USUM72345679",
-    explicit: false,
-  },
-];
+function formatFileSize(bytes: number | null | undefined): string {
+  if (bytes == null || Number.isNaN(bytes)) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function audioFormatLabel(track: ReleaseTrackItem): string {
+  const mime = track.audio?.mime_type?.trim();
+  if (mime?.includes("/")) {
+    return mime.split("/")[1]!.toUpperCase().slice(0, 12);
+  }
+  const name = track.audio?.file_name?.trim();
+  if (name?.includes(".")) {
+    return name.split(".").pop()!.toUpperCase();
+  }
+  return track.audio ? "Audio" : "—";
+}
 
 function formatReleaseTypeLabel(apiType: string | null | undefined): string {
   const t = (apiType || "").toLowerCase();
@@ -102,22 +111,41 @@ function toWorkflowStage(status: string | null | undefined): WorkflowStage {
 export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
   const [activeTab, setActiveTab] = useState("overview");
   const [detail, setDetail] = useState<ReleaseListItem | null>(null);
+  const [tracks, setTracks] = useState<ReleaseTrackItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [nowPlaying, setNowPlaying] = useState<{
+    title: string;
+    artist: string;
+    audioUrl: string;
+    artwork?: string;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
       setError(null);
+      setDetail(null);
+      setTracks([]);
+      setNowPlaying(null);
       try {
         const data = await getRelease(releaseId);
+        if (cancelled) return;
+        setDetail(data);
+
+        const trackList = await listReleaseTracks(releaseId).catch((e) => {
+          const message = e instanceof Error ? e.message : "Failed to load tracks";
+          toast.error(message);
+          return [] as ReleaseTrackItem[];
+        });
         if (!cancelled) {
-          setDetail(data);
+          setTracks(trackList);
         }
       } catch (err) {
         if (!cancelled) {
           setDetail(null);
+          setTracks([]);
           const message = err instanceof Error ? err.message : "Failed to load release";
           setError(message);
           toast.error(message);
@@ -258,6 +286,17 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
 
   return (
     <div className="space-y-4 sm:space-y-6">
+      {nowPlaying && (
+        <div className="sticky top-0 z-10 px-3.5 sm:px-[15px]">
+          <AudioPlayer
+            title={nowPlaying.title}
+            artist={nowPlaying.artist}
+            audioUrl={nowPlaying.audioUrl}
+            artwork={nowPlaying.artwork}
+            onClose={() => setNowPlaying(null)}
+          />
+        </div>
+      )}
       {/* Header */}
       <div className="flex flex-col sm:flex-row items-start gap-4 sm:gap-6 pt-4 sm:pt-[30px] px-3.5 sm:px-[15px] pb-3 sm:pb-[15px]">
         {onBack && (
@@ -416,27 +455,81 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
                 </div>
 
                 <div>
-                  <h3 className="font-semibold mb-2 sm:mb-3 text-sm sm:text-base">Tracks ({MOCK_TRACKS.length})</h3>
+                  <h3 className="font-semibold mb-2 sm:mb-3 text-sm sm:text-base">
+                    Tracks ({tracks.length})
+                  </h3>
                   <div className="space-y-2">
-                    {MOCK_TRACKS.map((track, index) => (
-                      <div
-                        key={track.id}
-                        className="flex items-center gap-2 sm:gap-4 p-2.5 sm:p-3 rounded-lg border"
-                      >
-                        <div className="h-7 w-7 sm:h-8 sm:w-8 rounded bg-[#ff0050]/10 flex items-center justify-center font-semibold text-[#ff0050] text-xs sm:text-sm flex-shrink-0">
-                          {index + 1}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="font-medium text-xs sm:text-sm truncate">{track.title}</p>
-                          <p className="text-[10px] sm:text-xs text-muted-foreground truncate">
-                            ISRC: {track.isrc} • {track.duration}
-                          </p>
-                        </div>
-                        <Badge variant="secondary" className="text-[10px] sm:text-xs flex-shrink-0">
-                          {track.explicit ? "Explicit" : "Clean"}
-                        </Badge>
-                      </div>
-                    ))}
+                    {tracks.length === 0 ? (
+                      <p className="text-xs sm:text-sm text-muted-foreground py-2">
+                        No tracks for this release.
+                      </p>
+                    ) : (
+                      tracks.map((track) => {
+                        const titleStr = track.title?.trim() || "Untitled track";
+                        const audioUrl = releaseArtworkUrlFromFilePath(track.audio?.file_path);
+                        const thumbUrl = releaseArtworkUrlFromFilePath(track.artwork?.file_path);
+                        const num = track.track_number ?? "—";
+                        const sizeStr = formatFileSize(track.audio?.file_size);
+                        const nameStr = track.audio?.file_name?.trim();
+                        const subLine = [nameStr || null, sizeStr || null]
+                          .filter(Boolean)
+                          .join(" · ");
+                        const subDisplay = subLine || "No audio file";
+                        return (
+                          <div
+                            key={track.id}
+                            className="flex items-center gap-2 sm:gap-4 p-2.5 sm:p-3 rounded-lg border"
+                          >
+                            <div className="h-7 w-7 sm:h-8 sm:w-8 rounded bg-[#ff0050]/10 flex items-center justify-center font-semibold text-[#ff0050] text-xs sm:text-sm flex-shrink-0">
+                              {num}
+                            </div>
+                            {thumbUrl ? (
+                              <div className="h-9 w-9 sm:h-10 sm:w-10 rounded-md overflow-hidden border flex-shrink-0 bg-muted">
+                                <img
+                                  src={thumbUrl}
+                                  alt=""
+                                  className="h-full w-full object-cover"
+                                />
+                              </div>
+                            ) : null}
+                            <div className="flex-1 min-w-0">
+                              <p className="font-medium text-xs sm:text-sm truncate">{titleStr}</p>
+                              <p
+                                className="text-[10px] sm:text-xs text-muted-foreground truncate"
+                                title={track.id}
+                              >
+                                {subDisplay}
+                              </p>
+                            </div>
+                            {audioUrl ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="icon"
+                                className="h-8 w-8 sm:h-9 sm:w-9 flex-shrink-0 border-[#ff0050]/30 hover:bg-[#ff0050]/10 hover:text-[#ff0050]"
+                                aria-label={`Play ${titleStr}`}
+                                onClick={() =>
+                                  setNowPlaying({
+                                    title: titleStr,
+                                    artist,
+                                    audioUrl,
+                                    artwork: thumbUrl ?? undefined,
+                                  })
+                                }
+                              >
+                                <PlayCircle className="h-4 w-4 sm:h-5 sm:w-5" />
+                              </Button>
+                            ) : null}
+                            <Badge
+                              variant="secondary"
+                              className="text-[10px] sm:text-xs flex-shrink-0 capitalize"
+                            >
+                              {audioFormatLabel(track)}
+                            </Badge>
+                          </div>
+                        );
+                      })
+                    )}
                   </div>
                 </div>
 
