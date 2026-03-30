@@ -51,7 +51,12 @@ import { cn } from "@/app/components/ui/utils";
 import { toast } from "sonner";
 import { AudioPlayer } from "@/app/components/audio-player";
 import { ReleaseInspector } from "@/app/components/release-inspector";
-import { deleteRelease, listReleases, type ReleaseListItem } from "@/services/releaseService";
+import {
+  deleteRelease,
+  listReleaseTracks,
+  listReleases,
+  type ReleaseListItem,
+} from "@/services/releaseService";
 import {
   artworkEmojiForId,
   formatReleaseDisplayDate,
@@ -78,7 +83,16 @@ interface Release {
   status: "live" | "scheduled" | "draft" | "rejected" | string;
   platforms: number;
   streams: number;
-  audioUrl?: string;
+}
+
+/** Sticky player state — audio URLs come from GET /api/releases/:id/tracks. */
+interface NowPlayingPreview {
+  releaseId: string;
+  title: string;
+  artist: string;
+  audioUrl: string;
+  /** Image URL for player cover (track artwork, else release cover). */
+  artworkUrl?: string | null;
 }
 
 function formatReleaseType(apiType: string | null | undefined): Release["type"] {
@@ -114,7 +128,6 @@ function mapApiReleaseToRelease(r: ReleaseListItem): Release {
     status: normalizeListStatus(r.status),
     platforms: 0,
     streams: 0,
-    audioUrl: undefined,
   };
 }
 
@@ -333,7 +346,7 @@ export function ReleasesView({ onNavigateToUpload, onEditRelease }: ReleasesView
   const [searchQuery, setSearchQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all-status");
-  const [nowPlaying, setNowPlaying] = useState<Release | null>(null);
+  const [nowPlaying, setNowPlaying] = useState<NowPlayingPreview | null>(null);
   const [inspectingRelease, setInspectingRelease] = useState<string | null>(null);
   const [deletingReleaseId, setDeletingReleaseId] = useState<string | null>(null);
   const [releasePendingDelete, setReleasePendingDelete] = useState<Release | null>(null);
@@ -390,20 +403,55 @@ export function ReleasesView({ onNavigateToUpload, onEditRelease }: ReleasesView
   });
 
   const handlePlayPreview = (release: Release) => {
-    if (release.audioUrl) {
-      setNowPlaying(release);
-    } else {
-      toast.error("No audio preview available");
-    }
+    void (async () => {
+      const dismiss = toast.loading("Loading preview…");
+      try {
+        const tracks = await listReleaseTracks(release.id);
+        const firstWithAudio = tracks.find((t) => t.audio?.file_path?.trim());
+        if (!firstWithAudio) {
+          toast.error("No audio in this release yet.", { id: dismiss });
+          return;
+        }
+        const audioUrl = releaseArtworkUrlFromFilePath(firstWithAudio.audio?.file_path);
+        if (!audioUrl) {
+          toast.error("No audio preview available.", { id: dismiss });
+          return;
+        }
+        const trackArt = releaseArtworkUrlFromFilePath(firstWithAudio.artwork?.file_path);
+        setNowPlaying({
+          releaseId: release.id,
+          title: firstWithAudio.title?.trim() || release.title,
+          artist: release.artist,
+          audioUrl,
+          artworkUrl: trackArt ?? release.artworkImageUrl,
+        });
+        toast.dismiss(dismiss);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to load tracks";
+        toast.error(message, { id: dismiss });
+      }
+    })();
   };
 
   const handleDownload = (release: Release) => {
-    if (release.audioUrl) {
-      toast.success("Download started!");
-      // In production, this would trigger an actual download
-    } else {
-      toast.error("No audio file available");
-    }
+    void (async () => {
+      try {
+        const tracks = await listReleaseTracks(release.id);
+        const firstWithAudio = tracks.find((t) => t.audio?.file_path?.trim());
+        const url = firstWithAudio
+          ? releaseArtworkUrlFromFilePath(firstWithAudio.audio?.file_path)
+          : null;
+        if (!url) {
+          toast.error("No audio file available for this release.");
+          return;
+        }
+        window.open(url, "_blank", "noopener,noreferrer");
+        toast.success("Download started");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to load tracks";
+        toast.error(message);
+      }
+    })();
   };
 
   const handleInspect = (releaseId: string) => {
@@ -428,7 +476,7 @@ export function ReleasesView({ onNavigateToUpload, onEditRelease }: ReleasesView
       const res = await deleteRelease(release.id);
       toast.success(res.message?.trim() || "Deleted successfully");
       setReleases((prev) => prev.filter((r) => r.id !== release.id));
-      if (nowPlaying?.id === release.id) {
+      if (nowPlaying?.releaseId === release.id) {
         setNowPlaying(null);
       }
       setReleasePendingDelete(null);
@@ -528,8 +576,8 @@ export function ReleasesView({ onNavigateToUpload, onEditRelease }: ReleasesView
           <AudioPlayer
             title={nowPlaying.title}
             artist={nowPlaying.artist}
-            audioUrl={nowPlaying.audioUrl!}
-            artwork={nowPlaying.artworkImageUrl ?? nowPlaying.artwork}
+            audioUrl={nowPlaying.audioUrl}
+            artwork={nowPlaying.artworkUrl ?? undefined}
             onClose={() => setNowPlaying(null)}
           />
         </div>

@@ -680,8 +680,17 @@ export async function uploadTrackAsset(
   const json = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    const err = (json || {}) as { message?: string; error?: string };
-    throw new Error(err.message || err.error || `Track asset upload failed (${response.status})`);
+    const err = (json || {}) as {
+      message?: string;
+      error?: string;
+      errors?: Record<string, string[]>;
+    };
+    let msg = err.message || err.error || `Track asset upload failed (${response.status})`;
+    if (err.errors && typeof err.errors === "object") {
+      const first = Object.values(err.errors).flat()[0];
+      if (first) msg = first;
+    }
+    throw new Error(msg);
   }
 
   return parseUploadTrackAssetResponse(json);
@@ -754,6 +763,70 @@ export async function createReleaseTrack(
       errors?: Record<string, string[]>;
     };
     let msg = err.message || err.error || `Create track failed (${response.status})`;
+    if (err.errors && typeof err.errors === "object") {
+      const first = Object.values(err.errors).flat()[0];
+      if (first) msg = first;
+    }
+    throw new Error(msg);
+  }
+
+  return parseCreateTrackResponse(json);
+}
+
+/** JSON body for PUT /api/tracks/:id (Postman). */
+export interface UpdateTrackJsonPayload {
+  title: string;
+  track_number: number;
+}
+
+async function doUpdateTrack(
+  accessToken: string,
+  trackId: string,
+  body: UpdateTrackJsonPayload
+): Promise<Response> {
+  const tid = trackId.trim();
+  return fetch(`${API_BASE_URL}/api/tracks/${encodeURIComponent(tid)}`, {
+    method: "PUT",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      title: body.title,
+      track_number: body.track_number,
+    }),
+  });
+}
+
+/**
+ * PUT /api/tracks/:trackId — JSON `title`, `track_number`. Accepts 200.
+ */
+export async function updateTrack(
+  trackId: string,
+  payload: UpdateTrackJsonPayload
+): Promise<CreateTrackResponse> {
+  const tid = trackId.trim();
+  if (!tid) {
+    throw new Error("Track id is required to update a track");
+  }
+  let token = await getValidAccessToken();
+  let response = await doUpdateTrack(token, tid, payload);
+
+  if (response.status === 401) {
+    token = await recoverAccessTokenAfterUnauthorized();
+    response = await doUpdateTrack(token, tid, payload);
+  }
+
+  const json = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const err = (json || {}) as {
+      message?: string;
+      error?: string;
+      errors?: Record<string, string[]>;
+    };
+    let msg = err.message || err.error || `Update track failed (${response.status})`;
     if (err.errors && typeof err.errors === "object") {
       const first = Object.values(err.errors).flat()[0];
       if (first) msg = first;

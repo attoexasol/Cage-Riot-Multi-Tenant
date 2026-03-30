@@ -47,9 +47,12 @@ import {
   createRelease,
   createReleaseTrack,
   getRelease,
+  listReleaseTracks,
   normalizeReleaseMetadata,
   updateRelease,
+  updateTrack,
   uploadReleaseArtwork,
+  uploadTrackAsset,
 } from "@/services/releaseService";
 import type { CreateReleaseMultipartPayload, ReleaseListItem } from "@/services/releaseService";
 import { formatReleaseDisplayDate, releaseArtworkUrlFromFilePath } from "@/lib/releaseFormat";
@@ -136,6 +139,8 @@ function pickArtworkFileForTrack(track: Track): File | null {
 
 interface Track {
   id: string;
+  /** Set when this row maps to an existing API track (PUT /api/tracks/:id). */
+  serverTrackId?: string;
   title: string;
   isrc: string;
   duration: string;
@@ -205,17 +210,19 @@ function createDefaultReleaseMetadata(): ReleaseMetadata {
     original_release_date: "",
     additional_metadata: [{ key: "", value: "" }],
     cover_image_file_name: "",
-    tracks: [
-      {
-        id: "1",
-        title: "",
-        isrc: "",
-        duration: "",
-        explicit: false,
-        genre: "",
-        files: [],
-      },
-    ],
+    tracks: [emptyTrackRow("1")],
+  };
+}
+
+function emptyTrackRow(id: string): Track {
+  return {
+    id,
+    title: "",
+    isrc: "",
+    duration: "",
+    explicit: false,
+    genre: "",
+    files: [],
   };
 }
 
@@ -275,6 +282,25 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
         });
         const coverFromApi = resolveReleaseCoverDisplayUrl(r);
         setExistingCoverImageUrl(coverFromApi ? withImageCacheBust(coverFromApi) : null);
+        let tracksForForm: Track[] = [];
+        try {
+          const apiTracks = await listReleaseTracks(editReleaseId.trim());
+          tracksForForm = apiTracks.map((t) => ({
+            id: t.id,
+            serverTrackId: t.id,
+            title: t.title?.trim() ?? "",
+            isrc: "",
+            duration: "",
+            explicit: false,
+            genre: "",
+            files: [],
+          }));
+        } catch {
+          tracksForForm = [];
+        }
+        if (tracksForForm.length === 0) {
+          tracksForForm = [emptyTrackRow("1")];
+        }
         setMetadata({
           title: r.title?.trim() ?? "",
           version_title: r.version_title?.trim() ?? "",
@@ -286,17 +312,7 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
           original_release_date: formatReleaseDisplayDate(r.original_release_date),
           additional_metadata: rows,
           cover_image_file_name: "",
-          tracks: [
-            {
-              id: "1",
-              title: "",
-              isrc: "",
-              duration: "",
-              explicit: false,
-              genre: "",
-              files: [],
-            },
-          ],
+          tracks: tracksForForm,
         });
       } catch (err) {
         if (!cancelled) {
@@ -473,6 +489,47 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
         if (coverImageFile) {
           artworkResult = await uploadReleaseArtwork(editingId, coverImageFile);
         }
+
+        const idMap = new Map<string, string>();
+        const titledTracks = metadata.tracks
+          .map((t, index) => ({ t, index }))
+          .filter(({ t }) => t.title.trim().length > 0);
+
+        for (const { t, index } of titledTracks) {
+          const audioF = pickAudioFileForTrack(t);
+          const artF = pickArtworkFileForTrack(t);
+          const n = index + 1;
+
+          if (t.serverTrackId?.trim()) {
+            await updateTrack(t.serverTrackId.trim(), {
+              title: t.title.trim(),
+              track_number: n,
+            });
+            if (audioF || artF) {
+              await uploadTrackAsset(t.serverTrackId.trim(), {
+                audioFile: audioF,
+                artworkFile: artF,
+              });
+            }
+          } else {
+            if (!audioF) {
+              throw new Error(
+                `New track "${t.title.trim()}" needs an audio file to create on the server.`
+              );
+            }
+            const created = await createReleaseTrack(editingId, {
+              title: t.title.trim(),
+              track_number: n,
+              audioFile: audioF,
+              artworkFile: artF,
+            });
+            const cid = created.id?.trim();
+            if (cid) {
+              idMap.set(t.id, cid);
+            }
+          }
+        }
+
         const msg =
           metaResult.message?.trim() ||
           artworkResult?.message?.trim() ||
@@ -483,7 +540,16 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
           if (prev) URL.revokeObjectURL(prev);
           return null;
         });
-        setMetadata((m) => ({ ...m, cover_image_file_name: "" }));
+        setMetadata((m) => {
+          let tracks = m.tracks;
+          if (idMap.size > 0) {
+            tracks = m.tracks.map((tr) => {
+              const sid = idMap.get(tr.id);
+              return sid ? { ...tr, id: sid, serverTrackId: sid } : tr;
+            });
+          }
+          return { ...m, tracks, cover_image_file_name: "" };
+        });
         try {
           const refreshed = await getRelease(editingId);
           const cover = resolveReleaseCoverDisplayUrl(refreshed);
