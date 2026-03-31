@@ -89,6 +89,12 @@ export interface ReleaseArtworkAsset {
   updated_at?: string | null;
 }
 
+/** Nested creator object from releases API payloads. */
+export interface ReleaseCreatorInfo {
+  id?: number | string | null;
+  name?: string | null;
+}
+
 /** Shape returned by GET /api/releases (array items). */
 export interface ReleaseListItem {
   id: string;
@@ -104,6 +110,7 @@ export interface ReleaseListItem {
   status?: string | null;
   organization_id?: string | null;
   created_by?: number | null;
+  creator?: ReleaseCreatorInfo | null;
   release_date?: string | null;
   original_release_date?: string | null;
   metadata?: unknown;
@@ -307,6 +314,7 @@ export interface ReleaseTrackItem {
   organization_id?: string | null;
   track_number?: number | null;
   created_by?: number | null;
+  creator?: ReleaseCreatorInfo | null;
   created_at?: string | null;
   updated_at?: string | null;
   audio?: TrackAssetInfo | null;
@@ -835,6 +843,50 @@ export async function updateTrack(
   }
 
   return parseCreateTrackResponse(json);
+}
+
+async function doDeleteTrack(accessToken: string, trackId: string): Promise<Response> {
+  const tid = trackId.trim();
+  return fetch(`${API_BASE_URL}/api/tracks/${encodeURIComponent(tid)}`, {
+    method: "DELETE",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+}
+
+export interface DeleteTrackResponse {
+  message?: string;
+}
+
+/**
+ * DELETE /api/tracks/:id with Bearer token; refreshes on 401 once.
+ */
+export async function deleteTrack(trackId: string): Promise<DeleteTrackResponse> {
+  const tid = trackId.trim();
+  if (!tid) {
+    throw new Error("Track id is required to delete a track");
+  }
+  let token = await getValidAccessToken();
+  let response = await doDeleteTrack(token, tid);
+
+  if (response.status === 401) {
+    token = await recoverAccessTokenAfterUnauthorized();
+    response = await doDeleteTrack(token, tid);
+  }
+
+  const json = (await response.json().catch(() => ({}))) as DeleteTrackResponse & {
+    error?: string;
+  };
+
+  if (!response.ok) {
+    const message = json.message || json.error || `Delete track failed (${response.status})`;
+    throw new Error(message);
+  }
+
+  return json;
 }
 
 async function doDeleteRelease(accessToken: string, id: string): Promise<Response> {

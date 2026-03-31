@@ -17,6 +17,9 @@ import {
   Globe,
   FileText,
   PlayCircle,
+  Download,
+  Trash2,
+  Loader2,
 } from "lucide-react";
 import { WorkflowStatus } from "@/app/components/workflow-status";
 import { QCValidation } from "@/app/components/qc-validation";
@@ -25,6 +28,7 @@ import { SampleLicenses } from "@/app/components/sample-licenses";
 import { MarketingFields } from "@/app/components/marketing-fields";
 import { DistributionStatus } from "@/app/components/distribution-status";
 import {
+  deleteTrack,
   getRelease,
   listReleaseTracks,
   normalizeReleaseMetadata,
@@ -38,6 +42,7 @@ import {
   releaseArtworkUrlFromFilePath,
 } from "@/lib/releaseFormat";
 import { toast } from "sonner";
+import { useAuth } from "@/app/components/auth/auth-context";
 
 interface ReleaseInspectorProps {
   releaseId: string;
@@ -109,11 +114,13 @@ function toWorkflowStage(status: string | null | undefined): WorkflowStage {
 }
 
 export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
+  const { user } = useAuth();
   const [activeTab, setActiveTab] = useState("overview");
   const [detail, setDetail] = useState<ReleaseListItem | null>(null);
   const [tracks, setTracks] = useState<ReleaseTrackItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deletingTrackId, setDeletingTrackId] = useState<string | null>(null);
   const [nowPlaying, setNowPlaying] = useState<{
     title: string;
     artist: string;
@@ -273,7 +280,8 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
     .sort(([a], [b]) => a.localeCompare(b));
 
   const createdByDisplay =
-    detail.created_by != null ? String(detail.created_by) : "—";
+    detail.creator?.name?.trim() ||
+    (detail.created_by != null ? String(detail.created_by) : "—");
   const createdAtStr = formatReleaseDisplayDate(detail.created_at) || "—";
   const updatedAtStr = formatReleaseDisplayDate(detail.updated_at) || "—";
   const idDisplay = detail.id || releaseId;
@@ -283,6 +291,25 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
   const versionTitleDisplay = detail.version_title?.trim() || "—";
   const originalReleaseDateStr =
     formatReleaseDisplayDate(detail.original_release_date) || "—";
+  const canDeleteTracks = user?.role !== "artist-viewer" && user?.role !== "viewer";
+
+  const handleDeleteTrack = async (track: ReleaseTrackItem) => {
+    if (deletingTrackId) return;
+    const titleStr = track.title?.trim() || "Untitled track";
+    const ok = window.confirm(`Delete "${titleStr}" from this release?`);
+    if (!ok) return;
+    setDeletingTrackId(track.id);
+    try {
+      const res = await deleteTrack(track.id);
+      setTracks((prev) => prev.filter((t) => t.id !== track.id));
+      toast.success(res.message?.trim() || "Track deleted.");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to delete track";
+      toast.error(message);
+    } finally {
+      setDeletingTrackId((id) => (id === track.id ? null : id));
+    }
+  };
 
   return (
     <div className="space-y-4 sm:space-y-6">
@@ -471,15 +498,51 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
                         const num = track.track_number ?? "—";
                         const sizeStr = formatFileSize(track.audio?.file_size);
                         const nameStr = track.audio?.file_name?.trim();
+                        const trackCreatorName =
+                          track.creator?.name?.trim() ||
+                          detail.creator?.name?.trim() ||
+                          (track.created_by != null ? `User ${track.created_by}` : null);
+                        const createdByLabel = trackCreatorName
+                          ? `Created by: ${trackCreatorName}`
+                          : null;
                         const subLine = [nameStr || null, sizeStr || null]
                           .filter(Boolean)
                           .join(" · ");
                         const subDisplay = subLine || "No audio file";
+                        const handleDownloadTrack = () => {
+                          if (!audioUrl) return;
+                          const fallbackName = `${titleStr}.audio`;
+                          const safeName = (nameStr && nameStr.trim()) || fallbackName;
+                          const link = document.createElement("a");
+                          link.href = audioUrl;
+                          link.download = safeName;
+                          link.rel = "noopener";
+                          document.body.appendChild(link);
+                          link.click();
+                          link.remove();
+                        };
                         return (
                           <div
                             key={track.id}
                             className="flex items-center gap-2 sm:gap-4 p-2.5 sm:p-3 rounded-lg border"
                           >
+                            {canDeleteTracks ? (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7 sm:h-8 sm:w-8 flex-shrink-0 text-[#ff0050] hover:text-[#ff0050] hover:bg-[#ff0050]/10"
+                                aria-label={`Delete ${titleStr}`}
+                                onClick={() => handleDeleteTrack(track)}
+                                disabled={deletingTrackId === track.id}
+                              >
+                                {deletingTrackId === track.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 sm:h-4 sm:w-4 animate-spin" />
+                                ) : (
+                                  <Trash2 className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+                                )}
+                              </Button>
+                            ) : null}
                             <div className="h-7 w-7 sm:h-8 sm:w-8 rounded bg-[#ff0050]/10 flex items-center justify-center font-semibold text-[#ff0050] text-xs sm:text-sm flex-shrink-0">
                               {num}
                             </div>
@@ -498,27 +561,39 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
                                 className="text-[10px] sm:text-xs text-muted-foreground truncate"
                                 title={track.id}
                               >
-                                {subDisplay}
+                                {[createdByLabel, subDisplay].filter(Boolean).join(" · ")}
                               </p>
                             </div>
                             {audioUrl ? (
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="icon"
-                                className="h-8 w-8 sm:h-9 sm:w-9 flex-shrink-0 border-[#ff0050]/30 hover:bg-[#ff0050]/10 hover:text-[#ff0050]"
-                                aria-label={`Play ${titleStr}`}
-                                onClick={() =>
-                                  setNowPlaying({
-                                    title: titleStr,
-                                    artist,
-                                    audioUrl,
-                                    artwork: thumbUrl ?? undefined,
-                                  })
-                                }
-                              >
-                                <PlayCircle className="h-4 w-4 sm:h-5 sm:w-5" />
-                              </Button>
+                              <div className="flex items-center gap-2">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="icon"
+                                  className="h-8 w-8 sm:h-9 sm:w-9 flex-shrink-0 border-[#ff0050]/30 hover:bg-[#ff0050]/10 hover:text-[#ff0050]"
+                                  aria-label={`Play ${titleStr}`}
+                                  onClick={() =>
+                                    setNowPlaying({
+                                      title: titleStr,
+                                      artist,
+                                      audioUrl,
+                                      artwork: thumbUrl ?? undefined,
+                                    })
+                                  }
+                                >
+                                  <PlayCircle className="h-4 w-4 sm:h-5 sm:w-5" />
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="icon"
+                                  className="h-8 w-8 sm:h-9 sm:w-9 flex-shrink-0 border-[#ff0050]/30 hover:bg-[#ff0050]/10 hover:text-[#ff0050]"
+                                  aria-label={`Download ${titleStr}`}
+                                  onClick={handleDownloadTrack}
+                                >
+                                  <Download className="h-4 w-4 sm:h-5 sm:w-5" />
+                                </Button>
+                              </div>
                             ) : null}
                             <Badge
                               variant="secondary"

@@ -54,7 +54,11 @@ import {
   uploadReleaseArtwork,
   uploadTrackAsset,
 } from "@/services/releaseService";
-import type { CreateReleaseMultipartPayload, ReleaseListItem } from "@/services/releaseService";
+import type {
+  CreateReleaseMultipartPayload,
+  ReleaseListItem,
+  TrackAssetInfo,
+} from "@/services/releaseService";
 import { formatReleaseDisplayDate, releaseArtworkUrlFromFilePath } from "@/lib/releaseFormat";
 
 function resolveReleaseCoverDisplayUrl(r: ReleaseListItem): string | null {
@@ -97,6 +101,24 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function trackAssetToUploadFile(
+  asset: TrackAssetInfo | null | undefined,
+  type: UploadFile["type"]
+): UploadFile | null {
+  if (!asset) return null;
+  const fileName = asset.file_name?.trim();
+  const id = asset.id?.trim();
+  if (!fileName && !id) return null;
+  return {
+    id: id || `${type}-${fileName || "asset"}`,
+    name: fileName || `${type} file`,
+    type,
+    size: typeof asset.file_size === "number" && asset.file_size >= 0 ? formatBytes(asset.file_size) : "Unknown",
+    progress: 100,
+    status: "complete",
+  };
+}
+
 const AUDIO_EXT = new Set([
   "wav",
   "mp3",
@@ -135,6 +157,18 @@ function pickAudioFileForTrack(track: Track): File | null {
 function pickArtworkFileForTrack(track: Track): File | null {
   const img = track.files.find((f) => f.type === "image" && f.file);
   return img?.file ?? null;
+}
+
+/** Title sent to the API when the field is empty (API still requires a title string). */
+function displayTrackTitleForApi(track: Track): string {
+  const trimmed = track.title.trim();
+  if (trimmed) return trimmed;
+  const audio = pickAudioFileForTrack(track);
+  if (audio?.name) {
+    const base = audio.name.replace(/\.[^.]+$/, "");
+    return base.trim() || "Untitled";
+  }
+  return "Untitled";
 }
 
 interface Track {
@@ -285,16 +319,22 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
         let tracksForForm: Track[] = [];
         try {
           const apiTracks = await listReleaseTracks(editReleaseId.trim());
-          tracksForForm = apiTracks.map((t) => ({
-            id: t.id,
-            serverTrackId: t.id,
-            title: t.title?.trim() ?? "",
-            isrc: "",
-            duration: "",
-            explicit: false,
-            genre: "",
-            files: [],
-          }));
+          tracksForForm = apiTracks.map((t) => {
+            const files = [
+              trackAssetToUploadFile(t.audio, "audio"),
+              trackAssetToUploadFile(t.artwork, "image"),
+            ].filter((f): f is UploadFile => f != null);
+            return {
+              id: t.id,
+              serverTrackId: t.id,
+              title: t.title?.trim() ?? "",
+              isrc: "",
+              duration: "",
+              explicit: false,
+              genre: "",
+              files,
+            };
+          });
         } catch {
           tracksForForm = [];
         }
@@ -491,18 +531,17 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
         }
 
         const idMap = new Map<string, string>();
-        const titledTracks = metadata.tracks
-          .map((t, index) => ({ t, index }))
-          .filter(({ t }) => t.title.trim().length > 0);
 
-        for (const { t, index } of titledTracks) {
+        for (let index = 0; index < metadata.tracks.length; index++) {
+          const t = metadata.tracks[index];
           const audioF = pickAudioFileForTrack(t);
           const artF = pickArtworkFileForTrack(t);
           const n = index + 1;
+          const titleForApi = displayTrackTitleForApi(t);
 
           if (t.serverTrackId?.trim()) {
             await updateTrack(t.serverTrackId.trim(), {
-              title: t.title.trim(),
+              title: titleForApi,
               track_number: n,
             });
             if (audioF || artF) {
@@ -513,12 +552,15 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
             }
           } else {
             if (!audioF) {
-              throw new Error(
-                `New track "${t.title.trim()}" needs an audio file to create on the server.`
-              );
+              if (t.title.trim()) {
+                throw new Error(
+                  `New track "${t.title.trim()}" needs an audio file to create on the server.`
+                );
+              }
+              continue;
             }
             const created = await createReleaseTrack(editingId, {
-              title: t.title.trim(),
+              title: titleForApi,
               track_number: n,
               audioFile: audioF,
               artworkFile: artF,
@@ -562,37 +604,54 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
         // 1) Create release — response must include `id` for the next step.
         const result = await createRelease(multipart);
         const newReleaseId = result.id?.trim();
-        const hasTracksToSave = metadata.tracks.some((t) => t.title.trim().length > 0);
+        const hasTracksToSave = metadata.tracks.some((t) => pickAudioFileForTrack(t) != null);
+        const successMessage =
+          result.message?.trim() ||
+          (result.status === "draft"
+            ? "Release created as draft."
+            : "Release submitted successfully.");
         // 2) POST /api/releases/:releaseId/tracks for each row (same order as UI).
         if (newReleaseId && hasTracksToSave) {
           for (let i = 0; i < metadata.tracks.length; i++) {
             const t = metadata.tracks[i];
-            if (!t.title.trim()) continue;
             const audioF = pickAudioFileForTrack(t);
             const artF = pickArtworkFileForTrack(t);
             if (!audioF) {
-              throw new Error(
-                `Track "${t.title.trim()}" needs an audio file (same as Postman: multipart field "audio").`
-              );
+              if (t.title.trim()) {
+                throw new Error(
+                  `Track "${t.title.trim()}" needs an audio file (same as Postman: multipart field "audio").`
+                );
+              }
+              continue;
             }
             await createReleaseTrack(newReleaseId, {
-              title: t.title,
+              title: displayTrackTitleForApi(t),
               track_number: i + 1,
               audioFile: audioF,
               artworkFile: artF,
             });
           }
+          toast.success(successMessage);
+          setMetadata(createDefaultReleaseMetadata());
+          setCoverImageFile(null);
+          setExistingCoverImageUrl(null);
+          setCoverImagePreviewUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return null;
+          });
         } else if (hasTracksToSave && !newReleaseId) {
           toast.error(
             "Release was created but no release id was returned, so tracks were not saved."
           );
         } else {
-          toast.success(
-            result.message?.trim() ||
-              (result.status === "draft"
-                ? "Release created as draft."
-                : "Release submitted successfully.")
-          );
+          toast.success(successMessage);
+          setMetadata(createDefaultReleaseMetadata());
+          setCoverImageFile(null);
+          setExistingCoverImageUrl(null);
+          setCoverImagePreviewUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return null;
+          });
         }
       }
     } catch (err) {
@@ -1025,107 +1084,6 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
                         placeholder="Enter track title"
                         className="w-full"
                       />
-                    </div>
-
-                    {/* ISRC & Duration - 2 Column on Mobile */}
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <Label htmlFor={`track-isrc-${track.id}`} className="text-xs text-muted-foreground mb-1.5 block">
-                          ISRC
-                        </Label>
-                        <Input
-                          id={`track-isrc-${track.id}`}
-                          value={track.isrc}
-                          onChange={(e) => updateTrack(track.id, "isrc", e.target.value)}
-                          placeholder="ISRC code"
-                          className="w-full"
-                        />
-                      </div>
-                      <div>
-                        <Label htmlFor={`track-duration-${track.id}`} className="text-xs text-muted-foreground mb-1.5 block">
-                          Duration
-                        </Label>
-                        <Input
-                          id={`track-duration-${track.id}`}
-                          value={track.duration}
-                          onChange={(e) => updateTrack(track.id, "duration", e.target.value)}
-                          placeholder="3:45"
-                          className="w-full"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Explicit & Genre - 2 Column on Mobile, Better on Desktop */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div>
-                        <Label htmlFor={`track-explicit-${track.id}`} className="text-xs text-muted-foreground mb-1.5 block">
-                          Content Rating
-                        </Label>
-                        <Select
-                          value={track.explicit ? "true" : "false"}
-                          onValueChange={(value) => updateTrack(track.id, "explicit", value === "true")}
-                        >
-                          <SelectTrigger id={`track-explicit-${track.id}`} className="w-full">
-                            <SelectValue>{track.explicit ? "Explicit" : "Clean"}</SelectValue>
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="true">Explicit</SelectItem>
-                            <SelectItem value="false">Clean</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div>
-                        <Label htmlFor={`track-genre-${track.id}`} className="text-xs text-muted-foreground mb-1.5 block">
-                          Genre
-                        </Label>
-                        <Select
-                          value={track.genre}
-                          onValueChange={(value) => updateTrack(track.id, "genre", value)}
-                        >
-                          <SelectTrigger id={`track-genre-${track.id}`} className="w-full">
-                            <SelectValue>{track.genre}</SelectValue>
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="pop">Pop</SelectItem>
-                            <SelectItem value="rock">Rock</SelectItem>
-                            <SelectItem value="hip-hop">Hip-Hop</SelectItem>
-                            <SelectItem value="indie">Indie</SelectItem>
-                            <SelectItem value="electronic">Electronic</SelectItem>
-                            <SelectItem value="country">Country</SelectItem>
-                            <SelectItem value="jazz">Jazz</SelectItem>
-                            <SelectItem value="classical">Classical</SelectItem>
-                            <SelectItem value="r&b">R&B</SelectItem>
-                            <SelectItem value="latin">Latin</SelectItem>
-                            <SelectItem value="folk">Folk</SelectItem>
-                            <SelectItem value="metal">Metal</SelectItem>
-                            <SelectItem value="punk">Punk</SelectItem>
-                            <SelectItem value="reggae">Reggae</SelectItem>
-                            <SelectItem value="soul">Soul</SelectItem>
-                            <SelectItem value="blues">Blues</SelectItem>
-                            <SelectItem value="world">World</SelectItem>
-                            <SelectItem value="alternative">Alternative</SelectItem>
-                            <SelectItem value="funk">Funk</SelectItem>
-                            <SelectItem value="disco">Disco</SelectItem>
-                            <SelectItem value="house">House</SelectItem>
-                            <SelectItem value="techno">Techno</SelectItem>
-                            <SelectItem value="trap">Trap</SelectItem>
-                            <SelectItem value="drum-and-bass">Drum and Bass</SelectItem>
-                            <SelectItem value="ambient">Ambient</SelectItem>
-                            <SelectItem value="experimental">Experimental</SelectItem>
-                            <SelectItem value="soundtrack">Soundtrack</SelectItem>
-                            <SelectItem value="spoken-word">Spoken Word</SelectItem>
-                            <SelectItem value="children">Children</SelectItem>
-                            <SelectItem value="holiday">Holiday</SelectItem>
-                            <SelectItem value="new-age">New Age</SelectItem>
-                            <SelectItem value="religious">Religious</SelectItem>
-                            <SelectItem value="comedy">Comedy</SelectItem>
-                            <SelectItem value="drama">Drama</SelectItem>
-                            <SelectItem value="documentary">Documentary</SelectItem>
-                            <SelectItem value="sound-effects">Sound Effects</SelectItem>
-                            <SelectItem value="other">Other</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
                     </div>
 
                     {/* Upload Files — scoped to this track */}

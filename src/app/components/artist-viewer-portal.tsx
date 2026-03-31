@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Music,
@@ -26,6 +26,7 @@ import {
   Briefcase,
   MapPin,
   Phone,
+  Eye,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -33,6 +34,10 @@ import { useAuth } from "@/app/components/auth/auth-context";
 import { useTheme } from "next-themes";
 import { RoleBadge, humanizeRoleName } from "@/app/components/ui/role-badge";
 import logo from "@/assets/1ba82f3a20d2d9c2e55dc299a173428eb2127875.png";
+import { formatReleaseDisplayDate, releaseArtworkUrlFromFilePath } from "@/lib/releaseFormat";
+import { listReleaseTracks, listReleases } from "@/services/releaseService";
+import type { ReleaseListItem } from "@/services/releaseService";
+import { ReleaseInspector } from "@/app/components/release-inspector";
 import {
   Card,
   CardContent,
@@ -92,9 +97,107 @@ interface Release {
   artwork: string;
   releaseDate: string;
   status: "Draft" | "Submitted" | "Approved" | "Distributed";
-  trackCount: number;
   lastUpdated: string;
 }
+
+function normalizeViewerReleaseStatus(
+  apiStatus: string | null | undefined
+): Release["status"] {
+  const s = (apiStatus || "draft").toLowerCase().trim();
+  if (s === "approved") return "Approved";
+  if (s === "distributed" || s === "live" || s === "published") return "Distributed";
+  if (s === "submitted" || s === "pending" || s === "scheduled") return "Submitted";
+  return "Draft";
+}
+
+function relativeOrDate(input: string | null | undefined): string {
+  const raw = (input || "").trim();
+  if (!raw) return "—";
+  const t = Date.parse(raw);
+  if (Number.isNaN(t)) {
+    const asDate = formatReleaseDisplayDate(raw);
+    return asDate || "—";
+  }
+  const diffMs = Date.now() - t;
+  const mins = Math.floor(diffMs / (1000 * 60));
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return formatReleaseDisplayDate(raw) || "—";
+}
+
+function mapApiReleaseToViewerRelease(
+  r: ReleaseListItem
+): Release {
+  const fp = r.artwork?.file_path?.trim() || "";
+  return {
+    id: r.id,
+    title: r.title?.trim() || "Untitled",
+    artwork:
+      releaseArtworkUrlFromFilePath(fp) ||
+      "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=300&h=300&fit=crop",
+    releaseDate: formatReleaseDisplayDate(r.release_date),
+    status: normalizeViewerReleaseStatus(r.status),
+    lastUpdated: relativeOrDate(r.updated_at || r.created_at),
+  };
+}
+
+const ReleaseStatusRow = React.memo(function ReleaseStatusRow({
+  release,
+  trackCount,
+  getStatusBadge,
+  onView,
+}: {
+  release: Release;
+  trackCount: number | null;
+  getStatusBadge: (status: Release["status"]) => React.ReactNode;
+  onView: (releaseId: string) => void;
+}) {
+  return (
+    <div className="flex flex-col sm:flex-row sm:items-center gap-4 p-4 border rounded-lg hover:bg-muted/50 transition-colors">
+      <img
+        src={release.artwork}
+        alt={release.title}
+        className="w-16 h-16 rounded-lg object-cover flex-shrink-0"
+      />
+      <div className="flex-1 min-w-0 space-y-1">
+        <h3 className="font-semibold text-sm sm:text-base truncate">{release.title}</h3>
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1">
+            <Calendar className="h-3 w-3" />
+            {release.releaseDate}
+          </span>
+          <span>•</span>
+          <span>{trackCount == null ? "— tracks" : `${trackCount} tracks`}</span>
+        </div>
+      </div>
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4">
+        <div className="flex flex-col items-start sm:items-end gap-1">
+          {getStatusBadge(release.status)}
+          <div className="flex items-center gap-1.5">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 text-muted-foreground hover:text-foreground"
+              aria-label={`View ${release.title} details`}
+              onClick={() => onView(release.id)}
+            >
+              <Eye className="h-3.5 w-3.5" />
+            </Button>
+            <span className="text-xs text-muted-foreground flex items-center gap-1">
+              <Clock className="h-3 w-3" />
+              {release.lastUpdated}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 const menuItems = [
   { id: "dashboard", label: "Dashboard", icon: Music },
@@ -148,53 +251,9 @@ export function ArtistViewerPortal() {
     activeReleases: 8,
   };
 
-  const releases: Release[] = [
-    {
-      id: "1",
-      title: "Summer Nights",
-      artwork: "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=300&h=300&fit=crop",
-      releaseDate: "2024-03-15",
-      status: "Distributed",
-      trackCount: 12,
-      lastUpdated: "2 hours ago",
-    },
-    {
-      id: "2",
-      title: "Electric Dreams",
-      artwork: "https://images.unsplash.com/photo-1514320291840-2e0a9bf2a9ae?w=300&h=300&fit=crop",
-      releaseDate: "2024-02-20",
-      status: "Distributed",
-      trackCount: 10,
-      lastUpdated: "1 day ago",
-    },
-    {
-      id: "3",
-      title: "Ocean Drive",
-      artwork: "https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=300&h=300&fit=crop",
-      releaseDate: "2024-04-01",
-      status: "Approved",
-      trackCount: 8,
-      lastUpdated: "3 days ago",
-    },
-    {
-      id: "4",
-      title: "Midnight City",
-      artwork: "https://images.unsplash.com/photo-1459749411175-04bf5292ceea?w=300&h=300&fit=crop",
-      releaseDate: "2024-04-15",
-      status: "Submitted",
-      trackCount: 14,
-      lastUpdated: "5 days ago",
-    },
-    {
-      id: "5",
-      title: "Neon Lights",
-      artwork: "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300&h=300&fit=crop",
-      releaseDate: "2024-05-01",
-      status: "Draft",
-      trackCount: 9,
-      lastUpdated: "1 week ago",
-    },
-  ];
+  const [releases, setReleases] = useState<Release[]>([]);
+  const [trackCounts, setTrackCounts] = useState<Record<string, number | null>>({});
+  const [inspectedReleaseId, setInspectedReleaseId] = useState<string | null>(null);
 
   const recentActivity = [
     {
@@ -293,6 +352,69 @@ export function ArtistViewerPortal() {
 
   const { logout, user } = useAuth();
   const { theme, setTheme } = useTheme();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const apiReleases = await listReleases();
+        if (cancelled) return;
+        setReleases(apiReleases.map(mapApiReleaseToViewerRelease));
+      } catch (err) {
+        if (cancelled) return;
+        setReleases([]);
+        const message = err instanceof Error ? err.message : "Failed to load releases";
+        toast.error(message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (releases.length === 0) {
+      setTrackCounts({});
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // Keep track count placeholders stable while background requests resolve.
+    setTrackCounts((prev) => {
+      const releaseIds = new Set(releases.map((r) => r.id));
+      const next: Record<string, number | null> = {};
+      for (const r of releases) {
+        next[r.id] = Object.prototype.hasOwnProperty.call(prev, r.id) ? prev[r.id] : null;
+      }
+      for (const id of Object.keys(prev)) {
+        if (!releaseIds.has(id)) {
+          delete next[id];
+        }
+      }
+      return next;
+    });
+
+    // Fire all count requests in parallel and update each release row progressively.
+    releases.forEach((release) => {
+      listReleaseTracks(release.id)
+        .then((tracks) => {
+          if (cancelled) return;
+          const count = tracks.length;
+          setTrackCounts((prev) => (prev[release.id] === count ? prev : { ...prev, [release.id]: count }));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setTrackCounts((prev) => (prev[release.id] === 0 ? prev : { ...prev, [release.id]: 0 }));
+        });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [releases]);
 
   // Chart colors that work in both themes
   const chartAxisColor = "#9ca3af"; // neutral gray that works in both modes
@@ -501,6 +623,13 @@ export function ArtistViewerPortal() {
 
   const renderReleases = () => (
     <div className="p-4 sm:p-5 md:p-6 lg:p-8 space-y-5 sm:space-y-6 lg:space-y-8 max-w-[1800px] mx-auto">
+      {inspectedReleaseId ? (
+        <ReleaseInspector
+          releaseId={inspectedReleaseId}
+          onBack={() => setInspectedReleaseId(null)}
+        />
+      ) : (
+        <>
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
         <div>
           <h2 className="text-xl sm:text-2xl lg:text-3xl font-semibold">Releases</h2>
@@ -509,54 +638,6 @@ export function ArtistViewerPortal() {
           </p>
         </div>
       </div>
-
-      {/* Release Status Table */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Release Status</CardTitle>
-          <CardDescription>
-            Track the status of all releases
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            {releases.map((release) => (
-              <div
-                key={release.id}
-                className="flex flex-col sm:flex-row sm:items-center gap-4 p-4 border rounded-lg hover:bg-muted/50 transition-colors"
-              >
-                <img
-                  src={release.artwork}
-                  alt={release.title}
-                  className="w-16 h-16 rounded-lg object-cover flex-shrink-0"
-                />
-                <div className="flex-1 min-w-0 space-y-1">
-                  <h3 className="font-semibold text-sm sm:text-base truncate">
-                    {release.title}
-                  </h3>
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                    <span className="flex items-center gap-1">
-                      <Calendar className="h-3 w-3" />
-                      {release.releaseDate}
-                    </span>
-                    <span>•</span>
-                    <span>{release.trackCount} tracks</span>
-                  </div>
-                </div>
-                <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4">
-                  <div className="flex flex-col items-start sm:items-end gap-1">
-                    {getStatusBadge(release.status)}
-                    <span className="text-xs text-muted-foreground flex items-center gap-1">
-                      <Clock className="h-3 w-3" />
-                      {release.lastUpdated}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
 
       {/* Release Summary */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
@@ -601,6 +682,31 @@ export function ArtistViewerPortal() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Release Status Table */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Release Status</CardTitle>
+          <CardDescription>
+            Track the status of all releases
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            {releases.map((release) => (
+              <ReleaseStatusRow
+                key={release.id}
+                release={release}
+                trackCount={trackCounts[release.id] ?? null}
+                getStatusBadge={getStatusBadge}
+                onView={setInspectedReleaseId}
+              />
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+        </>
+      )}
     </div>
   );
 

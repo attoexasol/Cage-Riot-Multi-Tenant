@@ -82,10 +82,24 @@ export function AudioPlayer({ title, artist, audioUrl, artwork, onClose }: Audio
   };
 
   const handleDownload = () => {
-    // Simulate download
-    toast.success("Download started!");
-    // In production, this would trigger an actual download
-    // window.open(audioUrl, '_blank');
+    try {
+      const safeTitle = title.trim() || "track";
+      const urlNoQuery = audioUrl.split("?")[0] ?? audioUrl;
+      const ext = urlNoQuery.split(".").pop()?.trim();
+      const fileName = ext ? `${safeTitle}.${ext}` : safeTitle;
+
+      const link = document.createElement("a");
+      link.href = audioUrl;
+      link.download = fileName;
+      link.rel = "noopener";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      toast.success("Download started!");
+    } catch {
+      window.open(audioUrl, "_blank", "noopener,noreferrer");
+      toast.success("Opened download in a new tab.");
+    }
   };
 
   const formatTime = (time: number) => {
