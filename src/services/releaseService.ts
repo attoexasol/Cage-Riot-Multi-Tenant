@@ -416,6 +416,217 @@ async function doCreateRelease(accessToken: string, formData: FormData): Promise
   });
 }
 
+async function doCreateReleaseJson(
+  accessToken: string,
+  body: Record<string, unknown>
+): Promise<Response> {
+  return fetch(`${API_BASE_URL}/api/releases`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+/** POST /api/releases with JSON body (cover already uploaded via signed URL). */
+export interface CreateReleaseJsonPayload {
+  title: string;
+  version_title: string;
+  primary_artist_name: string;
+  release_type: string;
+  upc: string;
+  label_name: string;
+  release_date: string;
+  original_release_date: string;
+  metadata: Record<string, string>;
+  file_path: string;
+  file_name: string;
+  mime_type: string;
+  file_size: number;
+}
+
+/**
+ * JSON create-release expects `metadata` as an array (Laravel validation), not a keyed object.
+ * We map each non-empty key from the form into `{ key, value }` entries.
+ */
+export function metadataMapToCreateReleaseArray(meta: Record<string, string>): unknown[] {
+  const out: unknown[] = [];
+  for (const [rawKey, rawVal] of Object.entries(meta)) {
+    const key = rawKey.trim();
+    if (!key) continue;
+    out.push({ key, value: rawVal });
+  }
+  return out;
+}
+
+export function buildCreateReleaseJsonBody(payload: CreateReleaseJsonPayload): Record<string, unknown> {
+  const releaseDate = normalizeOriginalReleaseDateForApi(payload.release_date);
+  const originalReleaseDate = normalizeOriginalReleaseDateForApi(payload.original_release_date);
+  return {
+    title: payload.title,
+    version_title: payload.version_title,
+    primary_artist_name: payload.primary_artist_name,
+    release_type: payload.release_type,
+    upc: payload.upc,
+    label_name: payload.label_name,
+    release_date: releaseDate,
+    original_release_date: originalReleaseDate,
+    metadata: metadataMapToCreateReleaseArray(payload.metadata),
+    file_path: payload.file_path,
+    file_name: payload.file_name,
+    mime_type: payload.mime_type,
+    file_size: payload.file_size,
+  };
+}
+
+/**
+ * POST /api/releases as JSON (after cover upload to signed URL). Accepts 200 or 201.
+ */
+export async function createReleaseJson(
+  payload: CreateReleaseJsonPayload
+): Promise<CreateReleaseResponse> {
+  const jsonBody = buildCreateReleaseJsonBody(payload);
+  let token = await getValidAccessToken();
+  let response = await doCreateReleaseJson(token, jsonBody);
+
+  if (response.status === 401) {
+    token = await recoverAccessTokenAfterUnauthorized();
+    response = await doCreateReleaseJson(token, jsonBody);
+  }
+
+  const json = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const body = (json || {}) as {
+      message?: string;
+      error?: string;
+      errors?: Record<string, string[]>;
+    };
+    let message =
+      body.message || body.error || `Create release failed (${response.status})`;
+    if (body.errors && typeof body.errors === "object") {
+      const first = Object.values(body.errors).flat()[0];
+      if (first) message = first;
+    }
+    throw new Error(message);
+  }
+
+  return parseCreateReleaseResponse(json);
+}
+
+/** Request body for POST /api/assets/signed-upload — only these two fields. */
+export interface SignedUploadRequest {
+  file_name: string;
+  file_type: string;
+}
+
+export interface SignedUploadResponse {
+  upload_url: string;
+  file_path: string;
+}
+
+function parseSignedUploadResponse(json: unknown): SignedUploadResponse {
+  if (!json || typeof json !== "object") {
+    throw new Error("Invalid signed-upload response");
+  }
+  const root = json as Record<string, unknown>;
+  const node =
+    root.data && typeof root.data === "object" && !Array.isArray(root.data)
+      ? (root.data as Record<string, unknown>)
+      : root;
+  const upload_url = String(node.upload_url ?? "").trim();
+  const file_path = String(node.file_path ?? "").trim();
+  if (!upload_url) {
+    throw new Error("Signed upload response missing upload_url");
+  }
+  if (!file_path) {
+    throw new Error("Signed upload response missing file_path");
+  }
+  return { upload_url, file_path };
+}
+
+async function doSignedUploadRequest(accessToken: string, body: SignedUploadRequest): Promise<Response> {
+  return fetch(`${API_BASE_URL}/api/assets/signed-upload`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      file_name: body.file_name,
+      file_type: body.file_type,
+    }),
+  });
+}
+
+/**
+ * POST /api/assets/signed-upload — body is only `file_name` and `file_type`.
+ */
+export async function requestAssetSignedUpload(body: SignedUploadRequest): Promise<SignedUploadResponse> {
+  const fileName = body.file_name.trim();
+  const fileType = body.file_type.trim();
+  if (!fileName) {
+    throw new Error("file_name is required for signed upload");
+  }
+  if (!fileType) {
+    throw new Error("file_type is required for signed upload");
+  }
+  let token = await getValidAccessToken();
+  let response = await doSignedUploadRequest(token, {
+    file_name: fileName,
+    file_type: fileType,
+  });
+
+  if (response.status === 401) {
+    token = await recoverAccessTokenAfterUnauthorized();
+    response = await doSignedUploadRequest(token, {
+      file_name: fileName,
+      file_type: fileType,
+    });
+  }
+
+  const json = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const err = (json || {}) as { message?: string; error?: string };
+    const message =
+      err.message || err.error || `Signed upload failed (${response.status})`;
+    throw new Error(message);
+  }
+
+  return parseSignedUploadResponse(json);
+}
+
+/**
+ * PUT binary file to the presigned `upload_url` (e.g. Cloudflare R2). No Bearer token.
+ */
+export async function uploadBinaryToSignedUrl(uploadUrl: string, file: File): Promise<void> {
+  const url = uploadUrl.trim();
+  if (!url) {
+    throw new Error("upload_url is required");
+  }
+  const contentType = file.type?.trim() || "application/octet-stream";
+  const response = await fetch(url, {
+    method: "PUT",
+    body: file,
+    headers: {
+      "Content-Type": contentType,
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    const snippet = text ? text.slice(0, 200) : "";
+    throw new Error(
+      `File upload to storage failed (${response.status})${snippet ? `: ${snippet}` : ""}`
+    );
+  }
+}
+
 function parseCreateReleaseResponse(json: unknown): CreateReleaseResponse {
   const root = (json || {}) as {
     message?: string;

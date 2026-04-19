@@ -45,17 +45,21 @@ import { cn } from "@/app/components/ui/utils";
 import { toast } from "sonner";
 import {
   createRelease,
+  createReleaseJson,
   createReleaseTrack,
   getRelease,
   listReleaseTracks,
   normalizeReleaseMetadata,
+  requestAssetSignedUpload,
   updateRelease,
   updateTrack,
+  uploadBinaryToSignedUrl,
   uploadReleaseArtwork,
   uploadTrackAsset,
 } from "@/services/releaseService";
 import type {
   CreateReleaseMultipartPayload,
+  CreateReleaseResponse,
   ReleaseListItem,
   TrackAssetInfo,
 } from "@/services/releaseService";
@@ -130,6 +134,18 @@ const AUDIO_EXT = new Set([
   "aif",
   "webm",
 ]);
+
+/** `file_type` for POST /api/assets/signed-upload when `File.type` is empty. */
+function mimeForSignedUpload(file: File): string {
+  const t = file.type?.trim();
+  if (t) return t;
+  const ext = file.name.split(".").pop()?.toLowerCase();
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "png") return "image/png";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return "image/jpeg";
+}
 
 function fileToUploadType(file: File): UploadFile["type"] {
   const t = file.type;
@@ -600,9 +616,27 @@ export function UploadContent({ editReleaseId = null, onEditConsumed }: UploadCo
           /* keep previous existingCoverImageUrl if refetch fails */
         }
       } else {
-        const multipart = buildMultipartPayload();
+        const fields = buildCreateReleasePayload();
+        let result: CreateReleaseResponse;
+        if (coverImageFile) {
+          const signed = await requestAssetSignedUpload({
+            file_name: coverImageFile.name,
+            file_type: mimeForSignedUpload(coverImageFile),
+          });
+          await uploadBinaryToSignedUrl(signed.upload_url, coverImageFile);
+          result = await createReleaseJson({
+            ...fields,
+            metadata: fields.metadata as Record<string, string>,
+            file_path: signed.file_path,
+            file_name: coverImageFile.name,
+            mime_type: coverImageFile.type?.trim() || mimeForSignedUpload(coverImageFile),
+            file_size: coverImageFile.size,
+          });
+        } else {
+          const multipart = buildMultipartPayload();
+          result = await createRelease(multipart);
+        }
         // 1) Create release — response must include `id` for the next step.
-        const result = await createRelease(multipart);
         const newReleaseId = result.id?.trim();
         const hasTracksToSave = metadata.tracks.some((t) => pickAudioFileForTrack(t) != null);
         const successMessage =

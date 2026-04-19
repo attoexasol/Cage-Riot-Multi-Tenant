@@ -598,9 +598,9 @@ export function ReleasesView({ onNavigateToUpload, onEditRelease }: ReleasesView
                 <Music className="h-5 w-5 text-[#ff0050]" />
               </div>
             </div>
-          </CardContent>
+          </CardContent> 
         </Card>
-
+ 
         <Card>
           <CardContent className="pt-6">
             <div className="flex items-center justify-between">
