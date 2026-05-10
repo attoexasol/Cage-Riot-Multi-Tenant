@@ -356,7 +356,7 @@ export function FeatureFlagsManagement() {
                             variant="ghost"
                             size="sm"
                             onClick={() => handleDeleteFlag(flag.id)}
-                            className="text-red-500 hover:text-red-600 hover:bg-red-500/10"
+                            className="text-destructive hover:text-destructive hover:bg-destructive/10"
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>

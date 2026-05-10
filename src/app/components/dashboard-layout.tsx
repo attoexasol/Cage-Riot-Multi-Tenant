@@ -65,8 +65,8 @@ interface DashboardLayoutProps {
 
 const navigationItems: NavItem[] = [
   { title: "Dashboard", icon: LayoutDashboard, href: "dashboard" },
-  { title: "Releases", icon: Disc3, href: "releases" },
-  { title: "Upload Content", icon: Upload, href: "upload" },
+  { title: "My Catalog", icon: Disc3, href: "releases" },
+  { title: "Create Release", icon: Upload, href: "upload" },
   { title: "Distribution Status", icon: Radio, href: "distribution", badge: 3 },
   { title: "Publishing", icon: FileMusic, href: "publishing" },
   { title: "Royalties", icon: DollarSign, href: "royalties" },
@@ -84,8 +84,8 @@ const navigationItems: NavItem[] = [
 
 const artistNavigationItems: NavItem[] = [
   { title: "Dashboard", icon: LayoutDashboard, href: "dashboard" },
-  { title: "My Releases", icon: Disc3, href: "releases" },
-  { title: "Upload Content", icon: Upload, href: "upload" },
+  { title: "My Catalog", icon: Disc3, href: "releases" },
+  { title: "Create Release", icon: Upload, href: "upload" },
   { title: "Release Status", icon: Radio, href: "distribution" },
   { title: "Analytics", icon: BarChart3, href: "analytics" },
   { title: "Royalties", icon: DollarSign, href: "royalties" },
@@ -123,11 +123,11 @@ export function DashboardLayout({ children, currentPage: currentPageProp, userRo
   };
 
   return (
-    <div className="h-screen flex overflow-hidden bg-background">
+    <div className="flex min-h-0 w-full flex-1 overflow-hidden bg-background">
       {/* Sidebar */}
       <aside
         className={cn(
-          "hidden lg:flex flex-col bg-sidebar border-r border-sidebar-border transition-all duration-300",
+          "hidden min-h-0 shrink-0 flex-col border-r border-sidebar-border bg-sidebar transition-all duration-300 lg:flex",
           sidebarCollapsed ? "w-16" : "w-64"
         )}
       >
@@ -157,7 +157,7 @@ export function DashboardLayout({ children, currentPage: currentPageProp, userRo
         </div>
 
         {/* Navigation */}
-        <ScrollArea className="flex-1 py-4">
+        <ScrollArea className="min-h-0 flex-1 py-4">
           <nav className="space-y-1 px-2">
             {filteredNavItems.map((item) => {
               const Icon = item.icon;
@@ -220,7 +220,7 @@ export function DashboardLayout({ children, currentPage: currentPageProp, userRo
       </aside>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {/* Top Navigation Bar */}
         <header className="h-16 border-b border-border bg-card flex items-center justify-between px-6">
           <div className="flex items-center gap-4 flex-1">
@@ -349,7 +349,7 @@ export function DashboardLayout({ children, currentPage: currentPageProp, userRo
         </header>
 
         {/* Page Content */}
-        <main className="flex-1 overflow-auto">
+        <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain scrollbar-hide">
           {children}
         </main>
       </div>

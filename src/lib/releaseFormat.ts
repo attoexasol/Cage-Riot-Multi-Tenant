@@ -1,14 +1,69 @@
 import { API_BASE_URL } from "@/config/env";
 
-/** Full URL for release artwork from GET `artwork.file_path` (e.g. `artworks/xxx.png`). Served under `/storage`. */
+/** How long before SigV4 expiry we proactively refetch (ms). */
+const PRESIGNED_REFRESH_BUFFER_MS = 45_000;
+
+/**
+ * Resolves `file_path` from the API for display (`<img src>`, audio URL, etc.):
+ * - `https://…` / `http://…` (e.g. R2 presigned) → used as-is
+ * - Relative keys (e.g. `releases/artwork/…`) → `{API_BASE_URL}/storage/{path}`
+ */
 export function releaseArtworkUrlFromFilePath(filePath: string | null | undefined): string | null {
   if (filePath == null) return null;
-  let path = String(filePath).trim().replace(/^\/+/, "");
-  if (!path) return null;
+  const raw = String(filePath).trim();
+  if (!raw) return null;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  let path = raw.replace(/^\/+/, "");
   if (path.toLowerCase().startsWith("storage/")) {
     path = path.slice("storage/".length);
   }
   return `${API_BASE_URL}/storage/${path}`;
+}
+
+/**
+ * Milliseconds until we should refetch release/track payloads to renew presigned URLs.
+ * Parses AWS query params `X-Amz-Date` + `X-Amz-Expires` when present; otherwise returns `null`
+ * (caller can still use `img` `onError` to refetch).
+ */
+export function getMsUntilPresignedUrlRefresh(urlString: string): number | null {
+  const s = urlString.trim();
+  if (!/^https?:\/\//i.test(s)) return null;
+  try {
+    const u = new URL(s);
+    const dateStr = u.searchParams.get("X-Amz-Date") ?? u.searchParams.get("x-amz-date");
+    const expiresStr = u.searchParams.get("X-Amz-Expires") ?? u.searchParams.get("x-amz-expires");
+    if (!dateStr || expiresStr == null) return null;
+    const expiresSec = parseInt(expiresStr, 10);
+    if (!Number.isFinite(expiresSec) || expiresSec <= 0) return null;
+    const m = dateStr.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+    if (!m) return null;
+    const issueMs = Date.UTC(
+      parseInt(m[1]!, 10),
+      parseInt(m[2]!, 10) - 1,
+      parseInt(m[3]!, 10),
+      parseInt(m[4]!, 10),
+      parseInt(m[5]!, 10),
+      parseInt(m[6]!, 10)
+    );
+    const expiryMs = issueMs + expiresSec * 1000;
+    const refreshAt = expiryMs - PRESIGNED_REFRESH_BUFFER_MS;
+    return Math.max(0, refreshAt - Date.now());
+  } catch {
+    return null;
+  }
+}
+
+/** Minimum delay among presigned HTTPS URLs in the list (or `null` if none need a timer). */
+export function earliestPresignedRefreshDelayMs(urls: Array<string | null | undefined>): number | null {
+  let min: number | null = null;
+  for (const u of urls) {
+    const s = u?.trim();
+    if (!s || !/^https?:\/\//i.test(s)) continue;
+    const d = getMsUntilPresignedUrlRefresh(s);
+    if (d == null) continue;
+    if (min == null || d < min) min = d;
+  }
+  return min;
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -91,6 +146,33 @@ export function normalizeOriginalReleaseDateForApi(input: string | null | undefi
   const head = raw.slice(0, 10);
   if (ISO_DATE.test(head)) return head;
   return formatReleaseDisplayDate(raw);
+}
+
+/**
+ * Returns the date string the UI should treat as the "Release Date" for a release row.
+ *
+ * The API exposes two fields:
+ *  - `release_date` — populated when the release is already out / ASAP-published.
+ *  - `scheduled_release_date` — populated when the artist chose a future drop date
+ *    (release_timing = "date"). Until the release goes live, only this one is set.
+ *
+ * Prefers a non-empty `scheduled_release_date` over a non-empty `release_date` so that
+ * draft / scheduled releases render their drop date instead of "—".
+ */
+export function pickEffectiveReleaseDate(
+  source: { release_date?: string | null; scheduled_release_date?: string | null } | null | undefined
+): string {
+  if (!source) return "";
+  const sched = source.scheduled_release_date?.trim() ?? "";
+  if (sched) return sched;
+  return source.release_date?.trim() ?? "";
+}
+
+/** Convenience wrapper: `pickEffectiveReleaseDate` + `formatReleaseDisplayDate`. */
+export function formatEffectiveReleaseDate(
+  source: { release_date?: string | null; scheduled_release_date?: string | null } | null | undefined
+): string {
+  return formatReleaseDisplayDate(pickEffectiveReleaseDate(source));
 }
 
 const ARTWORK_EMOJIS = ["🎵", "💿", "🎧", "🌊", "✨", "🎹", "🎸", "🎤"];

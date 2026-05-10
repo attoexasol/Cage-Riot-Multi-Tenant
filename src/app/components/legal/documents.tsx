@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/app/components/ui/card";
 import { Button } from "@/app/components/ui/button";
 import { Badge } from "@/app/components/ui/badge";
@@ -200,7 +200,25 @@ const mockDocuments: Document[] = [
   },
 ];
 
+const ALLOWED_UPLOAD_EXT = new Set(["pdf", "docx", "txt", "xlsx"]);
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+function formatFileSizeFromBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileTypeFromName(fileName: string): Document["fileType"] {
+  const ext = fileName.split(".").pop()?.toLowerCase() || "pdf";
+  if (ext === "docx") return "docx";
+  if (ext === "txt") return "txt";
+  if (ext === "xlsx") return "xlsx";
+  return "pdf";
+}
+
 export function DocumentsView() {
+  const [documents, setDocuments] = useState<Document[]>(() => [...mockDocuments]);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterCategory, setFilterCategory] = useState<string>("all");
   const [filterStatus, setFilterStatus] = useState<string>("all");
@@ -209,7 +227,44 @@ export function DocumentsView() {
   const [showViewDialog, setShowViewDialog] = useState(false);
   const [currentDocument, setCurrentDocument] = useState<Document | null>(null);
 
-  const filteredDocuments = mockDocuments
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploadTitle, setUploadTitle] = useState("");
+  const [uploadCategory, setUploadCategory] = useState<Document["category"] | "">("");
+  const [uploadArtist, setUploadArtist] = useState("");
+  const [uploadRelease, setUploadRelease] = useState("");
+  const [uploadExpiry, setUploadExpiry] = useState("");
+  const [uploadDescription, setUploadDescription] = useState("");
+  const [uploadTagsRaw, setUploadTagsRaw] = useState("");
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+
+  useEffect(() => {
+    if (!showUploadDialog) return;
+    setUploadTitle("");
+    setUploadCategory("");
+    setUploadArtist("");
+    setUploadRelease("");
+    setUploadExpiry("");
+    setUploadDescription("");
+    setUploadTagsRaw("");
+    setUploadFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, [showUploadDialog]);
+
+  const pickUploadFile = (file: File | null) => {
+    if (!file) return;
+    const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+    if (!ALLOWED_UPLOAD_EXT.has(ext)) {
+      toast.error("Please choose a PDF, DOCX, TXT, or XLSX file.");
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      toast.error("File is too large (maximum 10MB).");
+      return;
+    }
+    setUploadFile(file);
+  };
+
+  const filteredDocuments = documents
     .filter((doc) => {
       const matchesSearch =
         doc.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -236,9 +291,9 @@ export function DocumentsView() {
       return 0;
     });
 
-  const activeCount = mockDocuments.filter((d) => d.status === "active").length;
-  const pendingCount = mockDocuments.filter((d) => d.status === "pending_review").length;
-  const expiredCount = mockDocuments.filter((d) => d.status === "expired").length;
+  const activeCount = documents.filter((d) => d.status === "active").length;
+  const pendingCount = documents.filter((d) => d.status === "pending_review").length;
+  const expiredCount = documents.filter((d) => d.status === "expired").length;
 
   const handleView = (doc: Document) => {
     setCurrentDocument(doc);
@@ -257,7 +312,43 @@ export function DocumentsView() {
   };
 
   const handleUpload = () => {
-    toast.success("Document uploaded successfully");
+    const title = uploadTitle.trim();
+    if (!title) {
+      toast.error("Please enter a document title.");
+      return;
+    }
+    if (!uploadCategory) {
+      toast.error("Please select a category.");
+      return;
+    }
+    if (!uploadFile) {
+      toast.error("Please choose a file to upload.");
+      return;
+    }
+
+    const tags = uploadTagsRaw
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    const today = new Date().toISOString().slice(0, 10);
+    const newDoc: Document = {
+      id: `doc-${Date.now()}`,
+      title,
+      category: uploadCategory as Document["category"],
+      fileType: fileTypeFromName(uploadFile.name),
+      fileSize: formatFileSizeFromBytes(uploadFile.size),
+      uploadedBy: "You",
+      uploadDate: today,
+      status: "pending_review",
+      expiryDate: uploadExpiry.trim() || undefined,
+      associatedRelease: uploadRelease.trim() || undefined,
+      associatedArtist: uploadArtist.trim() || undefined,
+      description: uploadDescription.trim() || "No description provided.",
+      tags,
+    };
+
+    setDocuments((prev) => [newDoc, ...prev]);
+    toast.success("Document uploaded successfully", { description: uploadFile.name });
     setShowUploadDialog(false);
   };
 
@@ -347,7 +438,7 @@ export function DocumentsView() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-muted-foreground">Total Documents</p>
-                <p className="text-2xl font-semibold mt-1">{mockDocuments.length}</p>
+                <p className="text-2xl font-semibold mt-1">{documents.length}</p>
               </div>
               <div className="h-10 w-10 rounded-lg bg-[#ff0050]/10 flex items-center justify-center">
                 <FileText className="h-5 w-5 text-[#ff0050]" />
@@ -592,13 +683,21 @@ export function DocumentsView() {
           </DialogHeader>
           <div className="py-4 space-y-4">
             <div className="space-y-2">
-              <Label>Document Title *</Label>
-              <Input placeholder="Enter document title..." />
+              <Label htmlFor="legal-doc-title">Document Title *</Label>
+              <Input
+                id="legal-doc-title"
+                placeholder="Enter document title..."
+                value={uploadTitle}
+                onChange={(e) => setUploadTitle(e.target.value)}
+              />
             </div>
 
             <div className="space-y-2">
               <Label>Category *</Label>
-              <Select>
+              <Select
+                value={uploadCategory || undefined}
+                onValueChange={(v) => setUploadCategory(v as Document["category"])}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="Select category..." />
                 </SelectTrigger>
@@ -615,40 +714,98 @@ export function DocumentsView() {
 
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label>Associated Artist</Label>
-                <Input placeholder="Artist name (optional)" />
+                <Label htmlFor="legal-doc-artist">Associated Artist</Label>
+                <Input
+                  id="legal-doc-artist"
+                  placeholder="Artist name (optional)"
+                  value={uploadArtist}
+                  onChange={(e) => setUploadArtist(e.target.value)}
+                />
               </div>
               <div className="space-y-2">
-                <Label>Associated Release</Label>
-                <Input placeholder="Release name (optional)" />
+                <Label htmlFor="legal-doc-release">Associated Release</Label>
+                <Input
+                  id="legal-doc-release"
+                  placeholder="Release name (optional)"
+                  value={uploadRelease}
+                  onChange={(e) => setUploadRelease(e.target.value)}
+                />
               </div>
             </div>
 
             <div className="space-y-2">
-              <Label>Expiry Date (Optional)</Label>
-              <Input type="date" />
-            </div>
-
-            <div className="space-y-2">
-              <Label>Description</Label>
-              <Textarea
-                placeholder="Enter document description..."
-                className="min-h-[100px]"
+              <Label htmlFor="legal-doc-expiry">Expiry Date (Optional)</Label>
+              <Input
+                id="legal-doc-expiry"
+                type="date"
+                value={uploadExpiry}
+                onChange={(e) => setUploadExpiry(e.target.value)}
               />
             </div>
 
             <div className="space-y-2">
-              <Label>Tags (comma separated)</Label>
-              <Input placeholder="e.g., distribution, master, streaming" />
+              <Label htmlFor="legal-doc-desc">Description</Label>
+              <Textarea
+                id="legal-doc-desc"
+                placeholder="Enter document description..."
+                className="min-h-[100px]"
+                value={uploadDescription}
+                onChange={(e) => setUploadDescription(e.target.value)}
+              />
             </div>
 
             <div className="space-y-2">
-              <Label>File Upload *</Label>
-              <div className="border-2 border-dashed rounded-lg p-8 text-center hover:border-[#ff0050]/50 transition-colors cursor-pointer">
-                <Upload className="h-8 w-8 text-muted-foreground mx-auto mb-3" />
-                <p className="text-sm font-medium">Click to upload or drag and drop</p>
+              <Label htmlFor="legal-doc-tags">Tags (comma separated)</Label>
+              <Input
+                id="legal-doc-tags"
+                placeholder="e.g., distribution, master, streaming"
+                value={uploadTagsRaw}
+                onChange={(e) => setUploadTagsRaw(e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="legal-doc-file">File Upload *</Label>
+              <input
+                ref={fileInputRef}
+                id="legal-doc-file"
+                type="file"
+                accept=".pdf,.docx,.txt,.xlsx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                className="sr-only"
+                onChange={(e) => {
+                  const f = e.target.files?.[0] ?? null;
+                  pickUploadFile(f);
+                }}
+              />
+              <div
+                role="button"
+                tabIndex={0}
+                className="border-2 border-dashed rounded-lg p-8 text-center hover:border-[#ff0050]/50 transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-[#ff0050]/40"
+                onClick={() => fileInputRef.current?.click()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    fileInputRef.current?.click();
+                  }
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const f = e.dataTransfer.files?.[0] ?? null;
+                  pickUploadFile(f);
+                }}
+              >
+                <Upload className="h-8 w-8 text-muted-foreground mx-auto mb-3" aria-hidden />
+                <p className="text-sm font-medium">
+                  {uploadFile ? uploadFile.name : "Click to upload or drag and drop"}
+                </p>
                 <p className="text-xs text-muted-foreground mt-1">
                   PDF, DOCX, TXT, or XLSX (max 10MB)
+                  {uploadFile ? ` · ${formatFileSizeFromBytes(uploadFile.size)}` : null}
                 </p>
               </div>
             </div>
@@ -781,7 +938,7 @@ export function DocumentsView() {
                   <Button
                     variant="outline"
                     onClick={() => handleDelete(currentDocument)}
-                    className="w-full text-red-600 hover:text-red-700"
+                    className="w-full text-destructive hover:text-destructive"
                   >
                     <Trash2 className="h-4 w-4 mr-2" />
                     Delete Document

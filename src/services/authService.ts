@@ -10,10 +10,12 @@ export interface RegisterResponse {
   access_token: string;
   refresh_token?: string;
   token_type: string;
-  organization_id: number;
+  organization_id: number | string;
   organization_parent_id: number | null;
   organization_name?: string;
   role_name?: string;
+  /** When present, prefer this for display name after sign-up. */
+  user_name?: string;
   expires_in?: number;
 }
 
@@ -32,6 +34,8 @@ export interface LoginResponse {
   role_name?: string;
   user_role?: string;
   role?: string;
+  /** Display name from API (e.g. "Shadman Hussain"); omit for generic "Welcome back". */
+  user_name?: string;
   expires_in?: number;
 }
 

@@ -382,7 +382,7 @@ export function SuperAdminPortal() {
   };
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex min-h-0 w-full flex-1 overflow-hidden bg-background">
       {/* Sidebar */}
       <aside
         className={cn(
@@ -465,7 +465,7 @@ export function SuperAdminPortal() {
           </Button>
           <Button
             variant="outline"
-            className="w-full justify-start gap-3 text-red-500 hover:text-red-600 hover:bg-red-500/10"
+            className="w-full justify-start gap-3 text-destructive hover:text-destructive hover:bg-destructive/10"
             onClick={handleLogout}
           >
             <LogOut className="h-4 w-4" />

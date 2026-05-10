@@ -1,10 +1,11 @@
-import React, { useEffect, useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams, useNavigate, useSearchParams, useMatch } from "react-router-dom";
 import {
   Music,
   BarChart3,
   DollarSign,
   Bell,
+  Library,
   PlayCircle,
   TrendingUp,
   Globe,
@@ -30,14 +31,33 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { displayNameForWelcome } from "@/lib/authDisplay";
 import { useAuth } from "@/app/components/auth/auth-context";
 import { useTheme } from "next-themes";
 import { RoleBadge, humanizeRoleName } from "@/app/components/ui/role-badge";
 import logo from "@/assets/1ba82f3a20d2d9c2e55dc299a173428eb2127875.png";
-import { formatReleaseDisplayDate, releaseArtworkUrlFromFilePath } from "@/lib/releaseFormat";
-import { listReleaseTracks, listReleases } from "@/services/releaseService";
+import {
+  earliestPresignedRefreshDelayMs,
+  formatEffectiveReleaseDate,
+  formatReleaseDisplayDate,
+  pickEffectiveReleaseDate,
+  releaseArtworkUrlFromFilePath,
+} from "@/lib/releaseFormat";
+import { onReleaseCatalogChanged } from "@/lib/releaseEvents";
+import {
+  listReleaseTracks,
+  listReleases,
+  normalizeReleaseMetadata,
+} from "@/services/releaseService";
 import type { ReleaseListItem } from "@/services/releaseService";
-import { ReleaseInspector } from "@/app/components/release-inspector";
+import {
+  ArtistMusicWorkspace,
+  type ActivityTimelineItem,
+  type ActionIssueModel,
+  type WorkspaceBucket,
+  type WorkspaceReleaseCardModel,
+} from "@/app/components/artist/artist-music-workspace";
+import { ReleaseDistributionView } from "@/app/components/release-distribution-view";
 import {
   Card,
   CardContent,
@@ -96,16 +116,41 @@ interface Release {
   title: string;
   artwork: string;
   releaseDate: string;
-  status: "Draft" | "Submitted" | "Approved" | "Distributed";
+  status: "Draft" | "Submitted" | "Approved" | "Live" | "Rejected";
   lastUpdated: string;
+  workspaceBucket: WorkspaceBucket;
+  primaryArtistName: string;
+  releaseTypeLabel: string;
+  hasSparseMetadata: boolean;
+  missingContributorsSlot: boolean;
+}
+
+function formatReleaseTypeShort(apiType: string | null | undefined): string {
+  const t = (apiType || "").toLowerCase();
+  if (t === "ep") return "EP";
+  if (t === "single") return "Single";
+  if (t === "album") return "Album";
+  const raw = apiType?.trim();
+  if (!raw) return "Release";
+  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
+}
+
+function mapWorkspaceBucket(apiStatus: string | null | undefined): WorkspaceBucket {
+  const s = (apiStatus || "draft").toLowerCase().trim();
+  if (s === "rejected") return "rejected";
+  if (s === "approved") return "approved";
+  if (s === "distributed" || s === "live" || s === "published") return "live";
+  if (s === "submitted" || s === "pending" || s === "scheduled") return "in_review";
+  return "draft";
 }
 
 function normalizeViewerReleaseStatus(
   apiStatus: string | null | undefined
 ): Release["status"] {
   const s = (apiStatus || "draft").toLowerCase().trim();
+  if (s === "rejected") return "Rejected";
   if (s === "approved") return "Approved";
-  if (s === "distributed" || s === "live" || s === "published") return "Distributed";
+  if (s === "distributed" || s === "live" || s === "published") return "Live";
   if (s === "submitted" || s === "pending" || s === "scheduled") return "Submitted";
   return "Draft";
 }
@@ -129,19 +174,34 @@ function relativeOrDate(input: string | null | undefined): string {
   return formatReleaseDisplayDate(raw) || "—";
 }
 
-function mapApiReleaseToViewerRelease(
-  r: ReleaseListItem
-): Release {
+function mapApiReleaseToViewerRelease(r: ReleaseListItem): Release {
   const fp = r.artwork?.file_path?.trim() || "";
+  const meta = normalizeReleaseMetadata(r.metadata);
+  const hasSparseMetadata =
+    !r.upc?.trim() ||
+    !pickEffectiveReleaseDate(r) ||
+    !r.label_name?.trim() ||
+    !r.primary_artist_name?.trim();
+  const missingContributorsSlot =
+    Object.keys(meta).length > 0 &&
+    Object.entries(meta).some(
+      ([key, val]) =>
+        /contributor|credit|writer|publisher|producer|composer/i.test(key) && !String(val).trim()
+    );
   return {
     id: r.id,
     title: r.title?.trim() || "Untitled",
     artwork:
       releaseArtworkUrlFromFilePath(fp) ||
       "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=300&h=300&fit=crop",
-    releaseDate: formatReleaseDisplayDate(r.release_date),
+    releaseDate: formatEffectiveReleaseDate(r),
     status: normalizeViewerReleaseStatus(r.status),
     lastUpdated: relativeOrDate(r.updated_at || r.created_at),
+    workspaceBucket: mapWorkspaceBucket(r.status),
+    primaryArtistName: r.primary_artist_name?.trim() || "—",
+    releaseTypeLabel: formatReleaseTypeShort(r.release_type),
+    hasSparseMetadata,
+    missingContributorsSlot,
   };
 }
 
@@ -150,21 +210,26 @@ const ReleaseStatusRow = React.memo(function ReleaseStatusRow({
   trackCount,
   getStatusBadge,
   onView,
+  onArtworkImageError,
 }: {
   release: Release;
   trackCount: number | null;
   getStatusBadge: (status: Release["status"]) => React.ReactNode;
   onView: (releaseId: string) => void;
+  onArtworkImageError?: () => void;
 }) {
   return (
     <div className="flex flex-col sm:flex-row sm:items-center gap-4 p-4 border rounded-lg hover:bg-muted/50 transition-colors">
       <img
+        key={release.artwork}
         src={release.artwork}
         alt={release.title}
         className="w-16 h-16 rounded-lg object-cover flex-shrink-0"
+        onError={() => onArtworkImageError?.()}
       />
       <div className="flex-1 min-w-0 space-y-1">
         <h3 className="font-semibold text-sm sm:text-base truncate">{release.title}</h3>
+        <p className="text-xs text-muted-foreground truncate">{release.primaryArtistName}</p>
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1">
             <Calendar className="h-3 w-3" />
@@ -172,6 +237,13 @@ const ReleaseStatusRow = React.memo(function ReleaseStatusRow({
           </span>
           <span>•</span>
           <span>{trackCount == null ? "— tracks" : `${trackCount} tracks`}</span>
+          {trackCount === 0 &&
+          (release.workspaceBucket === "draft" || release.workspaceBucket === "in_review") ? (
+            <>
+              <span>•</span>
+              <span className="text-amber-600 dark:text-amber-400 font-medium">Incomplete</span>
+            </>
+          ) : null}
         </div>
       </div>
       <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4">
@@ -200,8 +272,8 @@ const ReleaseStatusRow = React.memo(function ReleaseStatusRow({
 });
 
 const menuItems = [
-  { id: "dashboard", label: "Dashboard", icon: Music },
-  { id: "releases", label: "Releases", icon: Music },
+  { id: "dashboard", label: "My Music Workspace", icon: Music },
+  { id: "releases", label: "My Catalog", icon: Library },
   { id: "analytics", label: "Analytics", icon: BarChart3 },
   { id: "revenue", label: "Revenue", icon: DollarSign },
   { id: "profile", label: "Profile", icon: User },
@@ -213,6 +285,9 @@ const VALID_TABS = new Set(menuItems.map((m) => m.id));
 export function ArtistViewerPortal() {
   const { tab: tabParam } = useParams<{ tab: string }>();
   const navigate = useNavigate();
+  const distributeMatch = useMatch({ path: "/artist/releases/:releaseId/distribute", end: true });
+  const distributionReleaseId = distributeMatch?.params?.releaseId?.trim() ?? null;
+  const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = tabParam && VALID_TABS.has(tabParam) ? tabParam : "dashboard";
   const setActiveTab = (id: string) => navigate(`/artist/${id}`);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -253,34 +328,6 @@ export function ArtistViewerPortal() {
 
   const [releases, setReleases] = useState<Release[]>([]);
   const [trackCounts, setTrackCounts] = useState<Record<string, number | null>>({});
-  const [inspectedReleaseId, setInspectedReleaseId] = useState<string | null>(null);
-
-  const recentActivity = [
-    {
-      id: "1",
-      type: "release",
-      title: "Summer Nights went live on Spotify",
-      date: "2 hours ago",
-      icon: Radio,
-      color: "text-green-500",
-    },
-    {
-      id: "2",
-      type: "milestone",
-      title: "Reached 100K streams on Electric Dreams",
-      date: "5 hours ago",
-      icon: TrendingUp,
-      color: "text-[#ff0050]",
-    },
-    {
-      id: "3",
-      type: "distribution",
-      title: "Midnight City sent to 8 platforms",
-      date: "2 days ago",
-      icon: Globe,
-      color: "text-purple-500",
-    },
-  ];
 
   const topTracks = [
     {
@@ -353,24 +400,47 @@ export function ArtistViewerPortal() {
   const { logout, user } = useAuth();
   const { theme, setTheme } = useTheme();
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const apiReleases = await listReleases();
-        if (cancelled) return;
-        setReleases(apiReleases.map(mapApiReleaseToViewerRelease));
-      } catch (err) {
-        if (cancelled) return;
+  const reloadReleasesFromApi = useCallback(async (opts?: { silent?: boolean }) => {
+    const silent = opts?.silent === true;
+    try {
+      const apiReleases = await listReleases();
+      setReleases(apiReleases.map(mapApiReleaseToViewerRelease));
+    } catch (err) {
+      if (!silent) {
         setReleases([]);
         const message = err instanceof Error ? err.message : "Failed to load releases";
         toast.error(message);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    }
   }, []);
+
+  useEffect(() => {
+    void reloadReleasesFromApi();
+  }, [reloadReleasesFromApi]);
+
+  useEffect(() => {
+    return onReleaseCatalogChanged(() => {
+      void reloadReleasesFromApi({ silent: true });
+    });
+  }, [reloadReleasesFromApi]);
+
+  const viewerArtworkRefreshCooldownRef = useRef(0);
+  const queueSilentViewerListRefetchFromArtworkError = useCallback(() => {
+    const now = Date.now();
+    if (now - viewerArtworkRefreshCooldownRef.current < 10_000) return;
+    viewerArtworkRefreshCooldownRef.current = now;
+    void reloadReleasesFromApi({ silent: true });
+  }, [reloadReleasesFromApi]);
+
+  useEffect(() => {
+    if (releases.length === 0) return;
+    const minDelay = earliestPresignedRefreshDelayMs(releases.map((r) => r.artwork));
+    if (minDelay == null) return;
+    const tid = window.setTimeout(() => {
+      void reloadReleasesFromApi({ silent: true });
+    }, minDelay);
+    return () => clearTimeout(tid);
+  }, [releases, reloadReleasesFromApi]);
 
   useEffect(() => {
     let cancelled = false;
@@ -416,6 +486,193 @@ export function ArtistViewerPortal() {
     };
   }, [releases]);
 
+  useEffect(() => {
+    if (activeTab !== "releases") return;
+    const raw = searchParams.get("open")?.trim();
+    if (!raw) return;
+    navigate(`/artist/releases/${encodeURIComponent(raw)}/distribute`, { replace: true });
+    const next = new URLSearchParams(searchParams);
+    next.delete("open");
+    setSearchParams(next, { replace: true });
+  }, [activeTab, searchParams, setSearchParams, navigate]);
+
+  const artistDisplayName = useMemo(() => displayNameForWelcome(user), [user]);
+
+  const statusCounts = useMemo(() => {
+    const base: Record<WorkspaceBucket, number> = {
+      draft: 0,
+      in_review: 0,
+      approved: 0,
+      live: 0,
+      rejected: 0,
+    };
+    for (const r of releases) {
+      base[r.workspaceBucket]++;
+    }
+    return base;
+  }, [releases]);
+
+  const workspaceReleaseCards = useMemo((): WorkspaceReleaseCardModel[] => {
+    return releases.map((r) => ({
+      id: r.id,
+      title: r.title,
+      primaryArtistName: r.primaryArtistName,
+      releaseTypeLabel: r.releaseTypeLabel,
+      artworkUrl: r.artwork,
+      lastEdited: r.lastUpdated,
+      workspaceBucket: r.workspaceBucket,
+      isIncomplete:
+        (r.workspaceBucket === "draft" || r.workspaceBucket === "in_review") &&
+        (trackCounts[r.id] === 0 || trackCounts[r.id] == null),
+    }));
+  }, [releases, trackCounts]);
+
+  const actionIssues = useMemo((): ActionIssueModel[] => {
+    const missingMeta = releases.filter((r) => r.hasSparseMetadata);
+    const rejected = releases.filter((r) => r.workspaceBucket === "rejected");
+    const contrib = releases.filter((r) => r.missingContributorsSlot);
+    const incompleteTracks = releases.filter((r) => {
+      const c = trackCounts[r.id];
+      return (
+        (r.workspaceBucket === "draft" || r.workspaceBucket === "in_review") &&
+        c === 0
+      );
+    });
+    const firstId = (arr: Release[]) => (arr[0] ? arr[0].id : null);
+    return [
+      {
+        id: "metadata",
+        title: "Missing metadata",
+        description: "Complete UPC, label, dates, and artist before submission.",
+        count: missingMeta.length,
+        severity: missingMeta.length ? "warning" : "info",
+        ctaLabel: missingMeta.length ? "Fix now" : "Review",
+        targetReleaseId: firstId(missingMeta),
+      },
+      {
+        id: "rejected",
+        title: "Rejected releases",
+        description: "QC or delivery rejected these address notes and resubmit.",
+        count: rejected.length,
+        severity: rejected.length ? "critical" : "info",
+        ctaLabel: rejected.length ? "Review" : "Review",
+        targetReleaseId: firstId(rejected),
+      },
+      {
+        id: "contributors",
+        title: "Missing contributors",
+        description: "Writer, publisher, or contributor credits look incomplete.",
+        count: contrib.length,
+        severity: contrib.length ? "warning" : "info",
+        ctaLabel: contrib.length ? "Fix now" : "Review",
+        targetReleaseId: firstId(contrib),
+      },
+      {
+        id: "tracks",
+        title: "Incomplete tracks",
+        description: "These releases still need audio or track details.",
+        count: incompleteTracks.length,
+        severity: incompleteTracks.length ? "warning" : "info",
+        ctaLabel: incompleteTracks.length ? "Fix now" : "Review",
+        targetReleaseId: firstId(incompleteTracks),
+      },
+    ];
+  }, [releases, trackCounts]);
+
+  const activityItems = useMemo((): ActivityTimelineItem[] => {
+    const fallback: ActivityTimelineItem[] = [
+      {
+        id: "f1",
+        title: "Release submitted for review",
+        time: "When you ship a build, it shows up here.",
+        tone: "info",
+      },
+      {
+        id: "f2",
+        title: "Approved by QC",
+        time: "QC milestones appear in this timeline.",
+        tone: "success",
+      },
+      {
+        id: "f3",
+        title: "Metadata issue found",
+        time: "We surface blockers so you can fix them fast.",
+        tone: "warning",
+      },
+    ];
+    if (releases.length === 0) return fallback;
+    const rows: ActivityTimelineItem[] = [];
+    const r0 = releases[0];
+    const r1 = releases[1];
+    const r2 = releases[2];
+    if (r0) {
+      rows.push({
+        id: "r0",
+        title:
+          r0.workspaceBucket === "live"
+            ? `${r0.title} · Release went live`
+            : r0.workspaceBucket === "rejected"
+              ? `${r0.title} · Rejected`
+              : `${r0.title} · Release submitted`,
+        time: r0.lastUpdated,
+        tone:
+          r0.workspaceBucket === "live"
+            ? "success"
+            : r0.workspaceBucket === "rejected"
+              ? "failure"
+              : "info",
+      });
+    }
+    if (r1) {
+      rows.push({
+        id: "r1",
+        title:
+          r1.hasSparseMetadata
+            ? `${r1.title} · Metadata issue found`
+            : `${r1.title} · Track updated`,
+        time: r1.lastUpdated,
+        tone: r1.hasSparseMetadata ? "warning" : "neutral",
+      });
+    }
+    if (r2) {
+      rows.push({
+        id: "r2",
+        title: `${r2.title} · Approved by QC`,
+        time: r2.lastUpdated,
+        tone: "success",
+      });
+    }
+    rows.push({
+      id: "art",
+      title: "Artwork validation passed",
+      time: "Automated checks",
+      tone: "success",
+    });
+    return rows;
+  }, [releases]);
+
+  const catalogFilteredReleases = useMemo(() => {
+    const buckets = new Set<WorkspaceBucket>(["draft", "in_review", "approved", "live", "rejected"]);
+    const c = searchParams.get("catalog")?.trim() as WorkspaceBucket | undefined;
+    const issue = searchParams.get("issue")?.trim();
+    let list = releases;
+    if (c && buckets.has(c)) {
+      list = list.filter((r) => r.workspaceBucket === c);
+    }
+    if (issue === "metadata") {
+      list = list.filter((r) => r.hasSparseMetadata);
+    } else if (issue === "contributors") {
+      list = list.filter((r) => r.missingContributorsSlot);
+    } else if (issue === "tracks") {
+      list = list.filter(
+        (r) =>
+          (r.workspaceBucket === "draft" || r.workspaceBucket === "in_review") &&
+          trackCounts[r.id] === 0
+      );
+    }
+    return list;
+  }, [releases, searchParams, trackCounts]);
+
   // Chart colors that work in both themes
   const chartAxisColor = "#9ca3af"; // neutral gray that works in both modes
   const chartGridColor = "#e5e7eb"; // light gray for grid
@@ -438,12 +695,14 @@ export function ArtistViewerPortal() {
   };
 
   const getStatusBadge = (status: Release["status"]) => {
-    const variants = {
+    const variants: Record<Release["status"], string> = {
       Draft: "bg-slate-500/10 text-slate-500 border-slate-500/20",
       Submitted: "bg-blue-500/10 text-blue-500 border-blue-500/20",
       Approved: "bg-green-500/10 text-green-500 border-green-500/20",
-      Distributed: "bg-[#ff0050]/10 text-[#ff0050] border-[#ff0050]/20",
+      Live: "bg-[#ff0050]/10 text-[#ff0050] border-[#ff0050]/20",
+      Rejected: "bg-red-500/10 text-red-600 dark:text-red-300 border-red-500/25",
     };
+    const label = status === "Submitted" ? "In Review" : status;
 
     return (
       <Badge
@@ -452,261 +711,119 @@ export function ArtistViewerPortal() {
           variants[status]
         )}
       >
-        {status}
+        {label}
       </Badge>
     );
   };
 
+  const handleWorkspaceActionIssue = useCallback(
+    (issue: ActionIssueModel) => {
+      if (issue.targetReleaseId) {
+        navigate(`/artist/releases/${encodeURIComponent(issue.targetReleaseId)}/distribute`);
+        return;
+      }
+      if (issue.id === "rejected") {
+        navigate("/artist/releases?catalog=rejected");
+        return;
+      }
+      navigate(`/artist/releases?issue=${encodeURIComponent(issue.id)}`);
+    },
+    [navigate]
+  );
+
   const renderDashboard = () => (
-    <div className="p-4 sm:p-5 md:p-6 lg:p-8 space-y-5 sm:space-y-6 lg:space-y-8 max-w-[1800px] mx-auto">
-      {/* Stats Grid - Responsive: 1 col mobile, 2 col tablet, 4 col desktop */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 sm:gap-4 lg:gap-5">
-        <Card>
-          <CardContent className="pt-5 sm:pt-6">
-            <div className="flex items-center justify-between">
-              <div className="flex-1 min-w-0 pr-3">
-                <p className="text-xs sm:text-sm text-muted-foreground truncate">
-                  Total Streams
-                </p>
-                <p className="text-xl sm:text-2xl md:text-3xl lg:text-4xl font-semibold mt-1 truncate">
-                  {formatNumber(stats.totalStreams)}
-                </p>
-                <p className="text-[10px] sm:text-xs text-green-500 mt-1">
-                  +12.3% this month
-                </p>
-              </div>
-              <div className="h-12 w-12 sm:h-14 sm:w-14 lg:h-16 lg:w-16 rounded-lg bg-[#ff0050]/10 flex items-center justify-center flex-shrink-0">
-                <PlayCircle className="h-6 w-6 sm:h-7 sm:w-7 lg:h-8 lg:w-8 text-[#ff0050]" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-5 sm:pt-6">
-            <div className="flex items-center justify-between">
-              <div className="flex-1 min-w-0 pr-3">
-                <p className="text-xs sm:text-sm text-muted-foreground truncate">
-                  Monthly Listeners
-                </p>
-                <p className="text-xl sm:text-2xl md:text-3xl lg:text-4xl font-semibold mt-1 truncate">
-                  {formatNumber(stats.monthlyListeners)}
-                </p>
-                <p className="text-[10px] sm:text-xs text-green-500 mt-1">
-                  +8.7% this month
-                </p>
-              </div>
-              <div className="h-12 w-12 sm:h-14 sm:w-14 lg:h-16 lg:w-16 rounded-lg bg-blue-500/10 flex items-center justify-center flex-shrink-0">
-                <TrendingUp className="h-6 w-6 sm:h-7 sm:w-7 lg:h-8 lg:w-8 text-blue-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-5 sm:pt-6">
-            <div className="flex items-center justify-between">
-              <div className="flex-1 min-w-0 pr-3">
-                <p className="text-xs sm:text-sm text-muted-foreground truncate">
-                  Total Revenue
-                </p>
-                <p className="text-xl sm:text-2xl md:text-3xl lg:text-4xl font-semibold mt-1 truncate">
-                  ${stats.totalRevenue.toLocaleString()}
-                </p>
-                <p className="text-[10px] sm:text-xs text-green-500 mt-1">
-                  +15.2% this month
-                </p>
-              </div>
-              <div className="h-12 w-12 sm:h-14 sm:w-14 lg:h-16 lg:w-16 rounded-lg bg-green-500/10 flex items-center justify-center flex-shrink-0">
-                <DollarSign className="h-6 w-6 sm:h-7 sm:w-7 lg:h-8 lg:w-8 text-green-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-5 sm:pt-6">
-            <div className="flex items-center justify-between">
-              <div className="flex-1 min-w-0 pr-3">
-                <p className="text-xs sm:text-sm text-muted-foreground truncate">
-                  Active Releases
-                </p>
-                <p className="text-xl sm:text-2xl md:text-3xl lg:text-4xl font-semibold mt-1 truncate">
-                  {stats.activeReleases}
-                </p>
-                <p className="text-[10px] sm:text-xs text-blue-500 mt-1">
-                  2 pending
-                </p>
-              </div>
-              <div className="h-12 w-12 sm:h-14 sm:w-14 lg:h-16 lg:w-16 rounded-lg bg-purple-500/10 flex items-center justify-center flex-shrink-0">
-                <Music className="h-6 w-6 sm:h-7 sm:w-7 lg:h-8 lg:w-8 text-purple-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Recent Activity & Top Tracks - Responsive: 1 col mobile/tablet, 2 col laptop+ */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5 lg:gap-6 xl:gap-8">
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base sm:text-lg">Recent Activity</CardTitle>
-            <CardDescription>Latest updates on your releases</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-4">
-              {recentActivity.map((activity) => {
-                const Icon = activity.icon;
-                return (
-                  <div
-                    key={activity.id}
-                    className="flex items-start gap-3 pb-4 last:pb-0 border-b last:border-0"
-                  >
-                    <div
-                      className={cn(
-                        "h-8 w-8 rounded-lg bg-muted flex items-center justify-center flex-shrink-0",
-                        activity.color
-                      )}
-                    >
-                      <Icon className="h-4 w-4" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium">{activity.title}</p>
-                      <p className="text-xs text-muted-foreground mt-1">
-                        {activity.date}
-                      </p>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base sm:text-lg">Top Tracks</CardTitle>
-            <CardDescription>Your most streamed tracks</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-4">
-              {topTracks.map((track, index) => (
-                <div
-                  key={track.id}
-                  className="flex items-center gap-3 pb-4 last:pb-0 border-b last:border-0"
-                >
-                  <div className="text-sm font-semibold text-muted-foreground w-4">
-                    {index + 1}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium truncate">{track.title}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {formatNumber(track.streams)} streams
-                    </p>
-                  </div>
-                  <div
-                    className={cn(
-                      "text-xs font-medium",
-                      track.trend === "up" ? "text-green-500" : "text-red-500"
-                    )}
-                  >
-                    {track.change}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    </div>
+    <ArtistMusicWorkspace
+      artistDisplayName={artistDisplayName}
+      releases={workspaceReleaseCards}
+      statusCounts={statusCounts}
+      actionIssues={actionIssues}
+      activityItems={activityItems}
+      onNavigateCatalog={(bucket) => navigate(`/artist/releases?catalog=${bucket}`)}
+      onOpenRelease={(id) => navigate(`/artist/releases/${encodeURIComponent(id)}/distribute`)}
+      onActionIssue={handleWorkspaceActionIssue}
+    />
   );
 
   const renderReleases = () => (
     <div className="p-4 sm:p-5 md:p-6 lg:p-8 space-y-5 sm:space-y-6 lg:space-y-8 max-w-[1800px] mx-auto">
-      {inspectedReleaseId ? (
-        <ReleaseInspector
-          releaseId={inspectedReleaseId}
-          onBack={() => setInspectedReleaseId(null)}
-        />
-      ) : (
-        <>
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
         <div>
-          <h2 className="text-xl sm:text-2xl lg:text-3xl font-semibold">Releases</h2>
+          <h2 className="text-xl sm:text-2xl lg:text-3xl font-semibold tracking-tight">My Catalog</h2>
           <p className="text-sm md:text-base text-muted-foreground mt-1">
-            View release status and details
+            Manage music — filtered views match your workspace cards.
           </p>
         </div>
       </div>
 
-      {/* Release Summary */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
-        <Card>
-          <CardContent className="pt-6">
-            <div className="text-center">
-              <p className="text-2xl font-semibold text-[#ff0050]">
-                {releases.filter((r) => r.status === "Distributed").length}
-              </p>
-              <p className="text-xs text-muted-foreground mt-1">Distributed</p>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="text-center">
-              <p className="text-2xl font-semibold text-green-500">
-                {releases.filter((r) => r.status === "Approved").length}
-              </p>
-              <p className="text-xs text-muted-foreground mt-1">Approved</p>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="text-center">
-              <p className="text-2xl font-semibold text-blue-500">
-                {releases.filter((r) => r.status === "Submitted").length}
-              </p>
-              <p className="text-xs text-muted-foreground mt-1">Submitted</p>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className="text-center">
-              <p className="text-2xl font-semibold text-slate-500">
-                {releases.filter((r) => r.status === "Draft").length}
-              </p>
-              <p className="text-xs text-muted-foreground mt-1">Draft</p>
-            </div>
-          </CardContent>
-        </Card>
+      {(searchParams.get("catalog") || searchParams.get("issue")) && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary" className="font-normal">
+            Filtered view
+          </Badge>
+          <Button variant="ghost" size="sm" className="h-8 text-[#ff0050]" onClick={() => navigate("/artist/releases")}>
+            Clear filters
+          </Button>
+        </div>
+      )}
+
+      {/* Release status summary — same buckets as workspace */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3 sm:gap-4">
+        {(
+          [
+            { bucket: "draft" as const, label: "Drafts" },
+            { bucket: "in_review" as const, label: "In Review" },
+            { bucket: "approved" as const, label: "Approved" },
+            { bucket: "live" as const, label: "Live" },
+            { bucket: "rejected" as const, label: "Rejected" },
+          ] as const
+        ).map(({ bucket, label }) => {
+          const active = searchParams.get("catalog") === bucket && !searchParams.get("issue");
+          return (
+            <button
+              key={bucket}
+              type="button"
+              onClick={() => navigate(`/artist/releases?catalog=${bucket}`)}
+              className={cn(
+                "rounded-xl border p-4 text-left transition-all hover:-translate-y-0.5 hover:shadow-md",
+                active
+                  ? "border-[#ff0050]/50 bg-[#ff0050]/5 ring-1 ring-[#ff0050]/20"
+                  : "border-border/80 bg-card hover:border-[#ff0050]/25"
+              )}
+            >
+              <p className="text-2xl font-semibold tabular-nums">{statusCounts[bucket]}</p>
+              <p className="text-xs font-medium text-muted-foreground mt-1">{label}</p>
+            </button>
+          );
+        })}
       </div>
 
-      {/* Release Status Table */}
+      {/* Release list */}
       <Card>
         <CardHeader>
-          <CardTitle>Release Status</CardTitle>
+          <CardTitle>Manage music</CardTitle>
           <CardDescription>
-            Track the status of all releases
+            {catalogFilteredReleases.length} release{catalogFilteredReleases.length === 1 ? "" : "s"} in this view
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="space-y-4">
-            {releases.map((release) => (
-              <ReleaseStatusRow
-                key={release.id}
-                release={release}
-                trackCount={trackCounts[release.id] ?? null}
-                getStatusBadge={getStatusBadge}
-                onView={setInspectedReleaseId}
-              />
-            ))}
-          </div>
+          {catalogFilteredReleases.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-6 text-center">Nothing matches this filter.</p>
+          ) : (
+            <div className="space-y-4">
+              {catalogFilteredReleases.map((release) => (
+                <ReleaseStatusRow
+                  key={release.id}
+                  release={release}
+                  trackCount={trackCounts[release.id] ?? null}
+                  getStatusBadge={getStatusBadge}
+                  onView={(id) => navigate(`/artist/releases/${encodeURIComponent(id)}/distribute`)}
+                  onArtworkImageError={queueSilentViewerListRefetchFromArtworkError}
+                />
+              ))}
+            </div>
+          )}
         </CardContent>
       </Card>
-        </>
-      )}
     </div>
   );
 
@@ -1339,7 +1456,7 @@ export function ArtistViewerPortal() {
               Name
             </label>
             <div className="p-3 border rounded-lg bg-muted/50">
-              <p className="text-sm">{user?.name}</p>
+              <p className="text-sm">{displayNameForWelcome(user) || "—"}</p>
             </div>
           </div>
           <div className="space-y-2">
@@ -1404,7 +1521,7 @@ export function ArtistViewerPortal() {
             </Button>
             <Button
               variant="outline"
-              className="justify-start text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950"
+              className="justify-start text-destructive hover:text-destructive hover:bg-destructive/10"
               onClick={handleLogout}
             >
               <LogOut className="mr-2 h-4 w-4" />
@@ -1417,6 +1534,20 @@ export function ArtistViewerPortal() {
   );
 
   const renderContent = () => {
+    if (distributionReleaseId) {
+      return (
+        <ReleaseDistributionView
+          releaseId={distributionReleaseId}
+          viewerMode
+          onBackToCatalog={() => navigate("/artist/releases")}
+          onEditInWorkspace={() => {
+            toast.info("View-only access", {
+              description: "Ask an account owner to change release details or distribution settings.",
+            });
+          }}
+        />
+      );
+    }
     switch (activeTab) {
       case "dashboard":
         return renderDashboard();
@@ -1436,7 +1567,7 @@ export function ArtistViewerPortal() {
   };
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex min-h-0 w-full flex-1 overflow-hidden bg-background">
       {/* Desktop Sidebar - Fixed (same design as artist-portal) */}
       <aside
         className={cn(
@@ -1470,7 +1601,7 @@ export function ArtistViewerPortal() {
         <nav className="flex-1 p-4 space-y-1 overflow-auto">
           {menuItems.map((item) => {
             const Icon = item.icon;
-            const isActive = activeTab === item.id;
+            const isActive = distributionReleaseId ? item.id === "releases" : activeTab === item.id;
             return (
               <button
                 key={item.id}
@@ -1550,7 +1681,7 @@ export function ArtistViewerPortal() {
           <nav className="flex-1 p-4 space-y-1 overflow-auto">
             {menuItems.map((item) => {
               const Icon = item.icon;
-              const isActive = activeTab === item.id;
+              const isActive = distributionReleaseId ? item.id === "releases" : activeTab === item.id;
               return (
                 <button
                   key={item.id}
@@ -1620,11 +1751,11 @@ export function ArtistViewerPortal() {
               </Button>
               <div className="min-w-0 flex-1">
                 <h1 className="text-base sm:text-lg lg:text-xl font-semibold truncate">
-                  {menuItems.find((item) => item.id === activeTab)?.label ||
-                    "Dashboard"}
+                  {menuItems.find((item) => item.id === activeTab)?.label || "My Music Workspace"}
                 </h1>
                 <p className="text-xs sm:text-sm text-muted-foreground hidden md:block truncate">
-                  View-only access • {user?.roleName ? humanizeRoleName(user.roleName) : user?.email}
+                  View-only access
+                  {user?.roleName ? ` · ${humanizeRoleName(user.roleName)}` : ""}
                 </p>
               </div>
             </div>

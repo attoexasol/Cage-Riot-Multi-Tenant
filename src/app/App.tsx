@@ -81,6 +81,25 @@ function AppContent() {
     }
   }, [isAuthenticated, location.pathname]);
 
+  /** No window scrollbar: scroll only inside portal layouts (e.g. artist main column). */
+  React.useEffect(() => {
+    if (!isAuthenticated) return;
+    const html = document.documentElement;
+    const body = document.body;
+    const prevHtmlOverflow = html.style.overflow;
+    const prevBodyOverflow = body.style.overflow;
+    html.classList.add("scrollbar-hide");
+    body.classList.add("scrollbar-hide");
+    html.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    return () => {
+      html.classList.remove("scrollbar-hide");
+      body.classList.remove("scrollbar-hide");
+      html.style.overflow = prevHtmlOverflow;
+      body.style.overflow = prevBodyOverflow;
+    };
+  }, [isAuthenticated]);
+
   const handleAuthNavigate = (page: AuthPage) => {
     setAuthPage(page);
     if (page === "signup") navigate("/signup", { replace: true });
@@ -200,7 +219,7 @@ function AppContent() {
   }
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="flex min-h-0 h-dvh max-h-dvh flex-col overflow-hidden bg-background">
       {/* Route based on user role */}
       {user?.role === "platform-super-admin" ? (
         <>
@@ -251,6 +270,7 @@ function AppContent() {
         <>
           <Routes>
             <Route path="/artist" element={<Navigate to="/artist/dashboard" replace />} />
+            <Route path="/artist/releases/:releaseId/distribute" element={<ArtistPortal />} />
             <Route path="/artist/:tab" element={<ArtistPortal />} />
             <Route path="*" element={<Navigate to="/artist/dashboard" replace />} />
           </Routes>
@@ -260,6 +280,7 @@ function AppContent() {
         <>
           <Routes>
             <Route path="/artist" element={<Navigate to="/artist/dashboard" replace />} />
+            <Route path="/artist/releases/:releaseId/distribute" element={<ArtistViewerPortal />} />
             <Route path="/artist/:tab" element={<ArtistViewerPortal />} />
             <Route path="*" element={<Navigate to="/artist/dashboard" replace />} />
           </Routes>
@@ -269,6 +290,7 @@ function AppContent() {
         <>
           <Routes>
             <Route path="/artist" element={<Navigate to="/artist/dashboard" replace />} />
+            <Route path="/artist/releases/:releaseId/distribute" element={<ArtistPortal />} />
             <Route path="/artist/:tab" element={<ArtistPortal />} />
             <Route path="*" element={<Navigate to="/artist/dashboard" replace />} />
           </Routes>

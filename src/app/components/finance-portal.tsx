@@ -831,7 +831,7 @@ export function FinancePortal() {
   };
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex min-h-0 w-full flex-1 overflow-hidden bg-background">
       {/* Mobile Overlay */}
       {isSidebarOpen && (
         <div

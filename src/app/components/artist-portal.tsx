@@ -1,7 +1,8 @@
-import React, { useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import React, { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { useParams, useNavigate, useMatch } from "react-router-dom";
 import {
   Music,
+  Library,
   Upload,
   Radio,
   BarChart3,
@@ -31,13 +32,37 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { displayNameForWelcome, welcomeBackLine } from "@/lib/authDisplay";
 import { useAuth } from "@/app/components/auth/auth-context";
 import { useTheme } from "next-themes";
-import { RoleBadge } from "@/app/components/ui/role-badge";
+import { RoleBadge, humanizeRoleName } from "@/app/components/ui/role-badge";
 import logo from "@/assets/1ba82f3a20d2d9c2e55dc299a173428eb2127875.png";
 import { AnalyticsView } from "@/app/components/analytics-view";
 import { ReleasesView } from "@/app/components/releases-view";
 import { UploadContent } from "@/app/components/upload-content";
+import { ReleaseDistributionView } from "@/app/components/release-distribution-view";
+import type { Section4Focus } from "@/lib/section4Validation";
+import {
+  ArtistMusicWorkspace,
+  type ActionIssueModel,
+  type ActivityTimelineItem,
+  type WorkspaceBucket,
+  type WorkspaceReleaseCardModel,
+} from "@/app/components/artist/artist-music-workspace";
+import {
+  earliestPresignedRefreshDelayMs,
+  formatEffectiveReleaseDate,
+  formatReleaseDisplayDate,
+  pickEffectiveReleaseDate,
+  releaseArtworkUrlFromFilePath,
+} from "@/lib/releaseFormat";
+import { onReleaseCatalogChanged } from "@/lib/releaseEvents";
+import {
+  listReleaseTracks,
+  listReleases,
+  normalizeReleaseMetadata,
+  type ReleaseListItem,
+} from "@/services/releaseService";
 import {
   Card,
   CardContent,
@@ -77,15 +102,6 @@ import {
   
 } from "@/app/components/ui/sheet";
 
-interface ArtistStats {
-  totalStreams: number;
-  monthlyListeners: number;
-  totalRevenue: number;
-  activeReleases: number;
-  liveOnPlatforms: number;
-  pendingReleases: number;
-}
-
 interface Notification {
   id: string;
   title: string;
@@ -96,9 +112,9 @@ interface Notification {
 }
 
 const menuItems = [
-  { id: "dashboard", label: "Dashboard", icon: Music, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
-  { id: "releases", label: "Releases", icon: Music, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
-  { id: "upload", label: "Upload", icon: Upload, roles: ["artist-owner", "account-owner"] },
+  { id: "dashboard", label: "My Music Workspace", icon: Music, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
+  { id: "releases", label: "My Catalog", icon: Library, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
+  { id: "upload", label: "Create Release", icon: Upload, roles: ["artist-owner", "account-owner"] },
   { id: "analytics", label: "Analytics", icon: BarChart3, roles: ["artist-owner", "artist-viewer", "account-owner", "viewer"] },
   { id: "royalties", label: "Royalties", icon: Wallet, roles: ["artist-owner", "account-owner"] },
   { id: "team", label: "Team", icon: Users, roles: ["artist-owner", "account-owner"] },
@@ -107,12 +123,108 @@ const menuItems = [
 
 const VALID_TABS = new Set(menuItems.map((m) => m.id));
 
+interface PortalWorkspaceRelease {
+  id: string;
+  title: string;
+  artwork: string;
+  releaseDate: string;
+  status: "Draft" | "Submitted" | "Approved" | "Live" | "Rejected";
+  lastUpdated: string;
+  workspaceBucket: WorkspaceBucket;
+  primaryArtistName: string;
+  releaseTypeLabel: string;
+  hasSparseMetadata: boolean;
+  missingContributorsSlot: boolean;
+}
+
+function formatReleaseTypeShort(apiType: string | null | undefined): string {
+  const t = (apiType || "").toLowerCase();
+  if (t === "ep") return "EP";
+  if (t === "single") return "Single";
+  if (t === "album") return "Album";
+  const raw = apiType?.trim();
+  if (!raw) return "Release";
+  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
+}
+
+function mapWorkspaceBucket(apiStatus: string | null | undefined): WorkspaceBucket {
+  const s = (apiStatus || "draft").toLowerCase().trim();
+  if (s === "rejected") return "rejected";
+  if (s === "approved") return "approved";
+  if (s === "distributed" || s === "live" || s === "published") return "live";
+  if (s === "submitted" || s === "pending" || s === "scheduled") return "in_review";
+  return "draft";
+}
+
+function normalizePortalReleaseStatus(
+  apiStatus: string | null | undefined
+): PortalWorkspaceRelease["status"] {
+  const s = (apiStatus || "draft").toLowerCase().trim();
+  if (s === "rejected") return "Rejected";
+  if (s === "approved") return "Approved";
+  if (s === "distributed" || s === "live" || s === "published") return "Live";
+  if (s === "submitted" || s === "pending" || s === "scheduled") return "Submitted";
+  return "Draft";
+}
+
+function relativeOrDatePortal(input: string | null | undefined): string {
+  const raw = (input || "").trim();
+  if (!raw) return "—";
+  const t = Date.parse(raw);
+  if (Number.isNaN(t)) {
+    const asDate = formatReleaseDisplayDate(raw);
+    return asDate || "—";
+  }
+  const diffMs = Date.now() - t;
+  const mins = Math.floor(diffMs / (1000 * 60));
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return formatReleaseDisplayDate(raw) || "—";
+}
+
+function mapApiReleaseToPortalWorkspace(r: ReleaseListItem): PortalWorkspaceRelease {
+  const fp = r.artwork?.file_path?.trim() || "";
+  const meta = normalizeReleaseMetadata(r.metadata);
+  const hasSparseMetadata =
+    !r.upc?.trim() ||
+    !pickEffectiveReleaseDate(r) ||
+    !r.label_name?.trim() ||
+    !r.primary_artist_name?.trim();
+  const missingContributorsSlot =
+    Object.keys(meta).length > 0 &&
+    Object.entries(meta).some(
+      ([key, val]) =>
+        /contributor|credit|writer|publisher|producer|composer/i.test(key) && !String(val).trim()
+    );
+  return {
+    id: r.id,
+    title: r.title?.trim() || "Untitled",
+    artwork:
+      releaseArtworkUrlFromFilePath(fp) ||
+      "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=300&h=300&fit=crop",
+    releaseDate: formatEffectiveReleaseDate(r),
+    status: normalizePortalReleaseStatus(r.status),
+    lastUpdated: relativeOrDatePortal(r.updated_at || r.created_at),
+    workspaceBucket: mapWorkspaceBucket(r.status),
+    primaryArtistName: r.primary_artist_name?.trim() || "—",
+    releaseTypeLabel: formatReleaseTypeShort(r.release_type),
+    hasSparseMetadata,
+    missingContributorsSlot,
+  };
+}
+
 export function ArtistPortal() {
   const { tab: tabParam } = useParams<{ tab: string }>();
   const navigate = useNavigate();
+  const distributeMatch = useMatch({ path: "/artist/releases/:releaseId/distribute", end: true });
+  const distributionReleaseId = distributeMatch?.params?.releaseId?.trim() ?? null;
   const activeTab = tabParam && VALID_TABS.has(tabParam) ? tabParam : "dashboard";
   const setActiveTab = (id: string) => navigate(`/artist/${id}`);
-  /** When set, Upload tab loads this release for editing (PUT). Cleared for a new upload. */
+  /** When set, Create Release tab loads this release for editing (PUT). Cleared for a new upload. */
   const [editReleaseId, setEditReleaseId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -170,91 +282,6 @@ export function ArtistPortal() {
       type: "info",
     },
   ]);
-
-  const stats: ArtistStats = {
-    totalStreams: 2847561,
-    monthlyListeners: 124832,
-    totalRevenue: 8234.56,
-    activeReleases: 8,
-    liveOnPlatforms: 8,
-    pendingReleases: 2,
-  };
-
-  const recentActivity = [
-    {
-      id: "1",
-      type: "release",
-      title: "Summer Nights went live on Spotify",
-      date: "2 hours ago",
-      icon: Radio,
-      color: "text-green-500",
-    },
-    {
-      id: "2",
-      type: "milestone",
-      title: "Reached 100K streams on Electric Dreams",
-      date: "5 hours ago",
-      icon: TrendingUp,
-      color: "text-[#ff0050]",
-    },
-    {
-      id: "3",
-      type: "revenue",
-      title: "Monthly royalty payment processed",
-      date: "1 day ago",
-      icon: DollarSign,
-      color: "text-blue-500",
-    },
-    {
-      id: "4",
-      type: "distribution",
-      title: "Midnight City sent to 8 platforms",
-      date: "2 days ago",
-      icon: Globe,
-      color: "text-purple-500",
-    },
-  ];
-
-  const topTracks = [
-    {
-      id: "1",
-      title: "Summer Nights",
-      streams: 1234567,
-      change: "+12.5%",
-      trend: "up",
-    },
-    {
-      id: "2",
-      title: "Electric Dreams",
-      streams: 876543,
-      change: "+8.3%",
-      trend: "up",
-    },
-    {
-      id: "3",
-      title: "Ocean Drive",
-      streams: 654321,
-      change: "+5.7%",
-      trend: "up",
-    },
-    {
-      id: "4",
-      title: "Neon Lights",
-      streams: 432109,
-      change: "-2.1%",
-      trend: "down",
-    },
-  ];
-
-  const formatNumber = (num: number) => {
-    if (num >= 1000000) {
-      return `${(num / 1000000).toFixed(1)}M`;
-    }
-    if (num >= 1000) {
-      return `${(num / 1000).toFixed(1)}K`;
-    }
-    return num.toString();
-  };
 
   const { logout, user } = useAuth();
   const { theme, setTheme } = useTheme();
@@ -341,231 +368,274 @@ export function ArtistPortal() {
 
   // Check if user is viewer (limited access)
   const isViewer = user?.role === "artist-viewer" || user?.role === "viewer";
+  const canCreateMusic = user?.role === "artist-owner" || user?.role === "account-owner";
+
+  const [portalReleases, setPortalReleases] = useState<PortalWorkspaceRelease[]>([]);
+  const [portalTrackCounts, setPortalTrackCounts] = useState<Record<string, number | null>>({});
+
+  const reloadPortalReleasesFromApi = useCallback(async (opts?: { silent?: boolean }) => {
+    const silent = opts?.silent === true;
+    try {
+      const apiReleases = await listReleases();
+      setPortalReleases(apiReleases.map(mapApiReleaseToPortalWorkspace));
+    } catch (err) {
+      if (!silent) {
+        setPortalReleases([]);
+        const message = err instanceof Error ? err.message : "Failed to load releases";
+        toast.error(message);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void reloadPortalReleasesFromApi();
+  }, [reloadPortalReleasesFromApi]);
+
+  useEffect(() => {
+    return onReleaseCatalogChanged(() => {
+      void reloadPortalReleasesFromApi({ silent: true });
+    });
+  }, [reloadPortalReleasesFromApi]);
+
+  useEffect(() => {
+    if (portalReleases.length === 0) return;
+    const minDelay = earliestPresignedRefreshDelayMs(portalReleases.map((r) => r.artwork));
+    if (minDelay == null) return;
+    const tid = window.setTimeout(() => {
+      void reloadPortalReleasesFromApi({ silent: true });
+    }, minDelay);
+    return () => clearTimeout(tid);
+  }, [portalReleases, reloadPortalReleasesFromApi]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (portalReleases.length === 0) {
+      setPortalTrackCounts({});
+      return () => {
+        cancelled = true;
+      };
+    }
+    setPortalTrackCounts((prev) => {
+      const releaseIds = new Set(portalReleases.map((r) => r.id));
+      const next: Record<string, number | null> = {};
+      for (const r of portalReleases) {
+        next[r.id] = Object.prototype.hasOwnProperty.call(prev, r.id) ? prev[r.id] : null;
+      }
+      for (const id of Object.keys(prev)) {
+        if (!releaseIds.has(id)) {
+          delete next[id];
+        }
+      }
+      return next;
+    });
+    portalReleases.forEach((release) => {
+      listReleaseTracks(release.id)
+        .then((tracks) => {
+          if (cancelled) return;
+          const count = tracks.length;
+          setPortalTrackCounts((prev) =>
+            prev[release.id] === count ? prev : { ...prev, [release.id]: count }
+          );
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setPortalTrackCounts((prev) =>
+            prev[release.id] === 0 ? prev : { ...prev, [release.id]: 0 }
+          );
+        });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [portalReleases]);
+
+  const artistDisplayName = useMemo(() => displayNameForWelcome(user), [user]);
+
+  const portalStatusCounts = useMemo(() => {
+    const base: Record<WorkspaceBucket, number> = {
+      draft: 0,
+      in_review: 0,
+      approved: 0,
+      live: 0,
+      rejected: 0,
+    };
+    for (const r of portalReleases) {
+      base[r.workspaceBucket]++;
+    }
+    return base;
+  }, [portalReleases]);
+
+  const portalWorkspaceCards = useMemo((): WorkspaceReleaseCardModel[] => {
+    return portalReleases.map((r) => ({
+      id: r.id,
+      title: r.title,
+      primaryArtistName: r.primaryArtistName,
+      releaseTypeLabel: r.releaseTypeLabel,
+      artworkUrl: r.artwork,
+      lastEdited: r.lastUpdated,
+      workspaceBucket: r.workspaceBucket,
+      isIncomplete:
+        (r.workspaceBucket === "draft" || r.workspaceBucket === "in_review") &&
+        (portalTrackCounts[r.id] === 0 || portalTrackCounts[r.id] == null),
+    }));
+  }, [portalReleases, portalTrackCounts]);
+
+  const portalActionIssues = useMemo((): ActionIssueModel[] => {
+    const missingMeta = portalReleases.filter((r) => r.hasSparseMetadata);
+    const rejected = portalReleases.filter((r) => r.workspaceBucket === "rejected");
+    const contrib = portalReleases.filter((r) => r.missingContributorsSlot);
+    const incompleteTracks = portalReleases.filter((r) => {
+      const c = portalTrackCounts[r.id];
+      return (
+        (r.workspaceBucket === "draft" || r.workspaceBucket === "in_review") &&
+        c === 0
+      );
+    });
+    const firstId = (arr: PortalWorkspaceRelease[]) => (arr[0] ? arr[0].id : null);
+    return [
+      {
+        id: "metadata",
+        title: "Missing metadata",
+        description: "Complete UPC, label, dates, and artist before submission.",
+        count: missingMeta.length,
+        severity: missingMeta.length ? "warning" : "info",
+        ctaLabel: missingMeta.length ? "Fix now" : "Review",
+        targetReleaseId: firstId(missingMeta),
+      },
+      {
+        id: "rejected",
+        title: "Rejected releases",
+        description: "QC or delivery rejected these address notes and resubmit.",
+        count: rejected.length,
+        severity: rejected.length ? "critical" : "info",
+        ctaLabel: rejected.length ? "Review" : "Review",
+        targetReleaseId: firstId(rejected),
+      },
+      {
+        id: "contributors",
+        title: "Missing contributors",
+        description: "Writer, publisher, or contributor credits look incomplete.",
+        count: contrib.length,
+        severity: contrib.length ? "warning" : "info",
+        ctaLabel: contrib.length ? "Fix now" : "Review",
+        targetReleaseId: firstId(contrib),
+      },
+      {
+        id: "tracks",
+        title: "Incomplete tracks",
+        description: "These releases still need audio or track details.",
+        count: incompleteTracks.length,
+        severity: incompleteTracks.length ? "warning" : "info",
+        ctaLabel: incompleteTracks.length ? "Fix now" : "Review",
+        targetReleaseId: firstId(incompleteTracks),
+      },
+    ];
+  }, [portalReleases, portalTrackCounts]);
+
+  const portalActivityItems = useMemo((): ActivityTimelineItem[] => {
+    const fallback: ActivityTimelineItem[] = [
+      {
+        id: "f1",
+        title: "Release submitted for review",
+        time: "When you ship a build, it shows up here.",
+        tone: "info",
+      },
+      {
+        id: "f2",
+        title: "Approved by QC",
+        time: "QC milestones appear in this timeline.",
+        tone: "success",
+      },
+      {
+        id: "f3",
+        title: "Metadata issue found",
+        time: "We surface blockers so you can fix them fast.",
+        tone: "warning",
+      },
+    ];
+    if (portalReleases.length === 0) return fallback;
+    const rows: ActivityTimelineItem[] = [];
+    const r0 = portalReleases[0];
+    const r1 = portalReleases[1];
+    const r2 = portalReleases[2];
+    if (r0) {
+      rows.push({
+        id: "r0",
+        title:
+          r0.workspaceBucket === "live"
+            ? `${r0.title} · Release went live`
+            : r0.workspaceBucket === "rejected"
+              ? `${r0.title} · Rejected`
+              : `${r0.title} · Release submitted`,
+        time: r0.lastUpdated,
+        tone:
+          r0.workspaceBucket === "live"
+            ? "success"
+            : r0.workspaceBucket === "rejected"
+              ? "failure"
+              : "info",
+      });
+    }
+    if (r1) {
+      rows.push({
+        id: "r1",
+        title: r1.hasSparseMetadata
+          ? `${r1.title} · Metadata issue found`
+          : `${r1.title} · Track updated`,
+        time: r1.lastUpdated,
+        tone: r1.hasSparseMetadata ? "warning" : "neutral",
+      });
+    }
+    if (r2) {
+      rows.push({
+        id: "r2",
+        title: `${r2.title} · Approved by QC`,
+        time: r2.lastUpdated,
+        tone: "success",
+      });
+    }
+    rows.push({
+      id: "art",
+      title: "Artwork validation passed",
+      time: "Automated checks",
+      tone: "success",
+    });
+    return rows;
+  }, [portalReleases]);
+
+  const handleWorkspaceActionIssuePortal = useCallback(
+    (issue: ActionIssueModel) => {
+      if (issue.targetReleaseId) {
+        navigate(`/artist/releases/${encodeURIComponent(issue.targetReleaseId)}/distribute`);
+        return;
+      }
+      if (issue.id === "rejected") {
+        navigate("/artist/releases?catalog=rejected");
+        return;
+      }
+      navigate(`/artist/releases?issue=${encodeURIComponent(issue.id)}`);
+    },
+    [navigate]
+  );
+
+  const goToCreateContent = useCallback(() => {
+    setEditReleaseId(null);
+    navigate("/artist/upload");
+  }, [navigate]);
 
   const renderDashboard = () => (
-    <div className="p-3 sm:p-4 md:p-6 space-y-4 sm:space-y-6">
-      {/* Stats Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs sm:text-sm text-muted-foreground">Total Streams</p>
-                <p className="text-xl sm:text-2xl md:text-3xl font-semibold mt-1">
-                  {formatNumber(stats.totalStreams)}
-                </p>
-                <p className="text-[10px] sm:text-xs text-green-500 mt-1">+12.3% this month</p>
-              </div>
-              <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-lg bg-[#ff0050]/10 flex items-center justify-center">
-                <PlayCircle className="h-5 w-5 sm:h-6 sm:w-6 text-[#ff0050]" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs sm:text-sm text-muted-foreground">Monthly Listeners</p>
-                <p className="text-xl sm:text-2xl md:text-3xl font-semibold mt-1">
-                  {formatNumber(stats.monthlyListeners)}
-                </p>
-                <p className="text-[10px] sm:text-xs text-green-500 mt-1">+8.7% this month</p>
-              </div>
-              <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-lg bg-blue-500/10 flex items-center justify-center">
-                <Users className="h-5 w-5 sm:h-6 sm:w-6 text-blue-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs sm:text-sm text-muted-foreground">Total Revenue</p>
-                <p className="text-xl sm:text-2xl md:text-3xl font-semibold mt-1">
-                  ${stats.totalRevenue.toLocaleString()}
-                </p>
-                <p className="text-[10px] sm:text-xs text-green-500 mt-1">+15.2% this month</p>
-              </div>
-              <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-lg bg-green-500/10 flex items-center justify-center">
-                <DollarSign className="h-5 w-5 sm:h-6 sm:w-6 text-green-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs sm:text-sm text-muted-foreground">Active Releases</p>
-                <p className="text-xl sm:text-2xl md:text-3xl font-semibold mt-1">{stats.activeReleases}</p>
-                <p className="text-[10px] sm:text-xs text-muted-foreground mt-1">
-                  {stats.liveOnPlatforms} platforms
-                </p>
-              </div>
-              <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-lg bg-purple-500/10 flex items-center justify-center">
-                <Music className="h-5 w-5 sm:h-6 sm:w-6 text-purple-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs sm:text-sm text-muted-foreground">Live on DSPs</p>
-                <p className="text-xl sm:text-2xl md:text-3xl font-semibold mt-1">{stats.liveOnPlatforms}</p>
-                <p className="text-[10px] sm:text-xs text-muted-foreground mt-1">
-                  All platforms active
-                </p>
-              </div>
-              <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-lg bg-green-500/10 flex items-center justify-center">
-                <Radio className="h-5 w-5 sm:h-6 sm:w-6 text-green-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs sm:text-sm text-muted-foreground">Pending Releases</p>
-                <p className="text-xl sm:text-2xl md:text-3xl font-semibold mt-1">{stats.pendingReleases}</p>
-                <p className="text-[10px] sm:text-xs text-muted-foreground mt-1">
-                  Awaiting distribution
-                </p>
-              </div>
-              <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-lg bg-orange-500/10 flex items-center justify-center">
-                <Calendar className="h-5 w-5 sm:h-6 sm:w-6 text-orange-500" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Top Tracks */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Top Performing Tracks</CardTitle>
-            <CardDescription>Last 30 days</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {topTracks.map((track, index) => (
-              <div key={track.id} className="flex items-center gap-4">
-                <div className="flex items-center justify-center h-10 w-10 rounded-lg bg-gradient-to-br from-[#ff0050] to-[#cc0040] text-white font-semibold flex-shrink-0">
-                  {index + 1}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium truncate">{track.title}</p>
-                  <p className="text-sm text-muted-foreground">
-                    {formatNumber(track.streams)} streams
-                  </p>
-                </div>
-                <Badge
-                  variant="secondary"
-                  className={cn(
-                    track.trend === "up"
-                      ? "bg-green-500/10 text-green-600 border-green-500/20"
-                      : "bg-red-500/10 text-red-600 border-red-500/20"
-                  )}
-                >
-                  {track.change}
-                </Badge>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-
-        {/* Recent Activity */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Recent Activity</CardTitle>
-            <CardDescription>Latest updates on your releases</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {recentActivity.map((activity) => {
-              const Icon = activity.icon;
-              return (
-                <div key={activity.id} className="flex items-start gap-3">
-                  <div
-                    className={cn(
-                      "h-9 w-9 rounded-lg flex items-center justify-center flex-shrink-0",
-                      activity.color === "text-green-500" && "bg-green-500/10",
-                      activity.color === "text-[#ff0050]" && "bg-[#ff0050]/10",
-                      activity.color === "text-blue-500" && "bg-blue-500/10",
-                      activity.color === "text-purple-500" && "bg-purple-500/10"
-                    )}
-                  >
-                    <Icon className={cn("h-4 w-4", activity.color)} />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium">{activity.title}</p>
-                    <p className="text-xs text-muted-foreground mt-0.5">
-                      {activity.date}
-                    </p>
-                  </div>
-                </div>
-              );
-            })}
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Quick Actions */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Quick Actions</CardTitle>
-          <CardDescription>Get started with common tasks</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-            {!isViewer && (
-              <Button
-                variant="outline"
-                className="h-auto flex-col gap-2 p-4"
-                onClick={() => setActiveTab("releases")}
-              >
-                <Upload className="h-5 w-5 text-[#ff0050]" />
-                <span className="text-sm font-medium">Upload New Release</span>
-              </Button>
-            )}
-            <Button
-              variant="outline"
-              className="h-auto flex-col gap-2 p-4"
-              onClick={() => setActiveTab("releases")}
-            >
-              <Music className="h-5 w-5 text-blue-500" />
-              <span className="text-sm font-medium">View Releases</span>
-            </Button>
-            <Button
-              variant="outline"
-              className="h-auto flex-col gap-2 p-4"
-              onClick={() => setActiveTab("analytics")}
-            >
-              <BarChart3 className="h-5 w-5 text-green-500" />
-              <span className="text-sm font-medium">View Analytics</span>
-            </Button>
-            {!isViewer && (
-              <Button
-                variant="outline"
-                className="h-auto flex-col gap-2 p-4"
-                onClick={() => setActiveTab("royalties")}
-              >
-                <Wallet className="h-5 w-5 text-purple-500" />
-                <span className="text-sm font-medium">View Royalties</span>
-              </Button>
-            )}
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+    <ArtistMusicWorkspace
+      artistDisplayName={artistDisplayName}
+      releases={portalWorkspaceCards}
+      statusCounts={portalStatusCounts}
+      actionIssues={portalActionIssues}
+      activityItems={portalActivityItems}
+      onNavigateCatalog={(bucket) => navigate(`/artist/releases?catalog=${bucket}`)}
+      onOpenRelease={(id) => navigate(`/artist/releases/${encodeURIComponent(id)}/distribute`)}
+      onActionIssue={handleWorkspaceActionIssuePortal}
+      onCreateNewRelease={canCreateMusic ? goToCreateContent : undefined}
+      onCreateNewTrack={canCreateMusic ? goToCreateContent : undefined}
+    />
   );
 
   const renderAnalytics = () => <AnalyticsView />;
@@ -969,6 +1039,19 @@ export function ArtistPortal() {
   );
 
   const renderContent = () => {
+    if (distributionReleaseId) {
+      return (
+        <ReleaseDistributionView
+          releaseId={distributionReleaseId}
+          viewerMode={user?.role === "viewer" || user?.role === "artist-viewer"}
+          onBackToCatalog={() => navigate("/artist/releases")}
+          onEditInWorkspace={(focus?: Section4Focus) => {
+            setEditReleaseId(distributionReleaseId);
+            navigate("/artist/upload", focus ? { state: { section4Focus: focus } } : undefined);
+          }}
+        />
+      );
+    }
     switch (activeTab) {
       case "dashboard":
         return renderDashboard();
@@ -983,6 +1066,9 @@ export function ArtistPortal() {
               setEditReleaseId(id);
               setActiveTab("upload");
             }}
+            onOpenReleaseWorkspace={(id) =>
+              navigate(`/artist/releases/${encodeURIComponent(id)}/distribute`)
+            }
           />
         );
       case "upload":
@@ -1006,10 +1092,10 @@ export function ArtistPortal() {
   };
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex min-h-0 w-full flex-1 overflow-hidden bg-background">
       {/* Left Sidebar - Hidden on mobile, shown on desktop */}
       <div className={cn(
-        "border-r bg-card flex-col transition-all duration-300 hidden lg:flex",
+        "border-r bg-card flex min-h-0 flex-col shrink-0 transition-all duration-300 hidden lg:flex",
         sidebarCollapsed ? "w-20" : "w-64"
       )}>
         {/* Logo + collapse toggle */}
@@ -1035,10 +1121,10 @@ export function ArtistPortal() {
         </div>
 
         {/* Navigation Menu */}
-        <nav className="flex-1 p-4 space-y-1 overflow-auto">
+        <nav className="min-h-0 flex-1 overflow-auto p-4 space-y-1">
           {filteredMenuItems.map((item) => {
             const Icon = item.icon;
-            const isActive = activeTab === item.id;
+            const isActive = distributionReleaseId ? item.id === "releases" : activeTab === item.id;
             return (
               <button
                 key={item.id}
@@ -1102,9 +1188,9 @@ export function ArtistPortal() {
       </div>
  
       {/* Main Content with Header */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {/* Top Header */}
-        <div className="border-b bg-card/50 backdrop-blur-sm">
+        <div className="shrink-0 border-b bg-card/50 backdrop-blur-sm">
           <div className="px-3 sm:px-4 md:px-6 py-3 md:py-4 flex items-center justify-between gap-2">
             {/* Mobile Menu + Title */}
             <div className="flex items-center gap-2 md:gap-3 flex-1 min-w-0">
@@ -1119,12 +1205,26 @@ export function ArtistPortal() {
               </Button>
 
               <div className="min-w-0">
-                <h1 className="text-lg sm:text-xl md:text-2xl font-semibold truncate">
-                  {menuItems.find(item => item.id === activeTab)?.label || "Dashboard"}
-                </h1>
-                <p className="text-xs sm:text-sm text-muted-foreground mt-0.5 truncate hidden sm:block">
-                  Welcome back, {user?.name || "The Waves"}
-                </p>
+                {distributionReleaseId ? (
+                  <h1 className="text-lg sm:text-xl md:text-2xl font-semibold truncate">Release & distribution</h1>
+                ) : (
+                  activeTab !== "upload" &&
+                  activeTab !== "releases" && (
+                    <h1 className="text-lg sm:text-xl md:text-2xl font-semibold truncate">
+                      {menuItems.find((item) => item.id === activeTab)?.label || "Dashboard"}
+                    </h1>
+                  )
+                )}
+                {!distributionReleaseId && activeTab !== "releases" && (
+                  <p
+                    className={cn(
+                      "text-xs sm:text-sm text-muted-foreground truncate",
+                      activeTab === "upload" ? "mt-0 block" : "mt-0.5 hidden sm:block"
+                    )}
+                  >
+                    {welcomeBackLine(user)}
+                  </p>
+                )}
               </div>
             </div>
             <div className="flex items-center gap-2 flex-shrink-0">
@@ -1224,8 +1324,8 @@ export function ArtistPortal() {
           </div>
         </div>
 
-        {/* Main Content Area - scrollbar hidden, scroll still works */}
-        <div className="flex-1 overflow-auto scrollbar-hide">
+        {/* Main Content Area — min-h-0 so flexbox does not inflate scroll height past real content */}
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain scrollbar-hide">
           {renderContent()}
         </div>
 
@@ -1435,7 +1535,7 @@ export function ArtistPortal() {
           <nav className="flex-1 p-4 space-y-1">
             {filteredMenuItems.map((item) => {
               const Icon = item.icon;
-              const isActive = activeTab === item.id;
+              const isActive = distributionReleaseId ? item.id === "releases" : activeTab === item.id;
               return (
                 <button
                   key={item.id}

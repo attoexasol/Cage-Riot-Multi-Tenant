@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Card, CardContent } from "@/app/components/ui/card";
 import { Button } from "@/app/components/ui/button";
 import { Badge } from "@/app/components/ui/badge";
@@ -30,7 +30,7 @@ import { DistributionStatus } from "@/app/components/distribution-status";
 import {
   deleteTrack,
   getRelease,
-  listReleaseTracks,
+  fetchReleaseTrackList,
   normalizeReleaseMetadata,
   type ReleaseListItem,
   type ReleaseTrackItem,
@@ -38,6 +38,7 @@ import {
 import { AudioPlayer } from "@/app/components/audio-player";
 import {
   artworkEmojiForId,
+  earliestPresignedRefreshDelayMs,
   formatReleaseDisplayDate,
   releaseArtworkUrlFromFilePath,
 } from "@/lib/releaseFormat";
@@ -141,11 +142,7 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
         if (cancelled) return;
         setDetail(data);
 
-        const trackList = await listReleaseTracks(releaseId).catch((e) => {
-          const message = e instanceof Error ? e.message : "Failed to load tracks";
-          toast.error(message);
-          return [] as ReleaseTrackItem[];
-        });
+        const trackList = await fetchReleaseTrackList(releaseId, data, (message) => toast.error(message));
         if (!cancelled) {
           setTracks(trackList);
         }
@@ -167,6 +164,39 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
       cancelled = true;
     };
   }, [releaseId]);
+
+  const silentRefetchReleaseAndTracks = useCallback(async () => {
+    if (!releaseId.trim()) return;
+    try {
+      const data = await getRelease(releaseId);
+      setDetail(data);
+      setTracks(await fetchReleaseTrackList(releaseId, data));
+    } catch {
+      /* keep existing UI on transient errors */
+    }
+  }, [releaseId]);
+
+  const mediaRefetchCooldownRef = useRef(0);
+  const queueSilentRefetchFromMediaError = useCallback(() => {
+    const now = Date.now();
+    if (now - mediaRefetchCooldownRef.current < 10_000) return;
+    mediaRefetchCooldownRef.current = now;
+    void silentRefetchReleaseAndTracks();
+  }, [silentRefetchReleaseAndTracks]);
+
+  useEffect(() => {
+    if (loading || !detail) return;
+    if (detail.id && releaseId && detail.id !== releaseId) return;
+    const minDelay = earliestPresignedRefreshDelayMs([
+      detail.artwork?.file_path,
+      ...tracks.flatMap((t) => [t.artwork?.file_path, t.audio?.file_path]),
+    ]);
+    if (minDelay == null) return;
+    const tid = window.setTimeout(() => {
+      void silentRefetchReleaseAndTracks();
+    }, minDelay);
+    return () => clearTimeout(tid);
+  }, [loading, detail, tracks, releaseId, silentRefetchReleaseAndTracks]);
 
   const getStatusBadge = (status: string) => {
     const variants: Record<string, { className: string; label: string; icon: React.ReactNode }> = {
@@ -268,7 +298,9 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
   const artist = detail.primary_artist_name?.trim() || "—";
   const releaseTypeLabel = formatReleaseTypeLabel(detail.release_type);
   const upc = detail.upc?.trim() || "—";
-  const releaseDateStr = formatReleaseDisplayDate(detail.release_date) || "—";
+  const scheduleOrRelease =
+    detail.scheduled_release_date?.trim() || detail.release_date?.trim() || "";
+  const releaseDateStr = formatReleaseDisplayDate(scheduleOrRelease) || "—";
   const labelName = detail.label_name?.trim() || "—";
   const statusRaw = detail.status?.trim() || "draft";
   const pathUrl = releaseArtworkUrlFromFilePath(detail.artwork?.file_path);
@@ -344,9 +376,11 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
               <div className="h-32 w-32 sm:h-40 sm:w-40 rounded-2xl overflow-hidden border-2 border-border shadow-lg hover:shadow-xl transition-all">
                 {artworkUrl ? (
                   <img
+                    key={artworkUrl}
                     src={artworkUrl}
                     alt={title}
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                    onError={() => queueSilentRefetchFromMediaError()}
                   />
                 ) : (
                   <div className="w-full h-full bg-gradient-to-br from-[#ff0050] to-[#cc0040] flex items-center justify-center text-4xl sm:text-5xl select-none">
@@ -463,6 +497,33 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
                         <p className="text-xs sm:text-sm text-muted-foreground">Version title</p>
                         <p className="font-medium text-sm sm:text-base">{versionTitleDisplay}</p>
                       </div>
+                      {detail.primary_genre?.trim() ? (
+                        <div>
+                          <p className="text-xs sm:text-sm text-muted-foreground">Primary genre</p>
+                          <p className="font-medium text-sm sm:text-base capitalize">{detail.primary_genre.trim()}</p>
+                        </div>
+                      ) : null}
+                      {detail.secondary_genre?.trim() ? (
+                        <div>
+                          <p className="text-xs sm:text-sm text-muted-foreground">Secondary genre</p>
+                          <p className="font-medium text-sm sm:text-base capitalize">{detail.secondary_genre.trim()}</p>
+                        </div>
+                      ) : null}
+                      {detail.scheduled_release_date?.trim() ? (
+                        <div>
+                          <p className="text-xs sm:text-sm text-muted-foreground">Scheduled release date</p>
+                          <p className="font-medium text-sm sm:text-base flex items-center gap-1 sm:gap-2">
+                            <Calendar className="h-3.5 w-3.5 text-[#ff0050] flex-shrink-0" />
+                            <span>{formatReleaseDisplayDate(detail.scheduled_release_date)}</span>
+                          </p>
+                        </div>
+                      ) : null}
+                      {detail.release_timing?.trim() ? (
+                        <div>
+                          <p className="text-xs sm:text-sm text-muted-foreground">Release timing</p>
+                          <p className="font-medium text-sm sm:text-base capitalize">{detail.release_timing.trim()}</p>
+                        </div>
+                      ) : null}
                       <div>
                         <p className="text-xs sm:text-sm text-muted-foreground">Original release date</p>
                         <p className="font-medium text-sm sm:text-base flex items-center gap-1 sm:gap-2">
@@ -505,7 +566,8 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
                         const createdByLabel = trackCreatorName
                           ? `Created by: ${trackCreatorName}`
                           : null;
-                        const subLine = [nameStr || null, sizeStr || null]
+                        const genreLine = track.primary_genre?.trim() || null;
+                        const subLine = [nameStr || null, sizeStr || null, genreLine]
                           .filter(Boolean)
                           .join(" · ");
                         const subDisplay = subLine || "No audio file";
@@ -549,9 +611,11 @@ export function ReleaseInspector({ releaseId, onBack }: ReleaseInspectorProps) {
                             {thumbUrl ? (
                               <div className="h-9 w-9 sm:h-10 sm:w-10 rounded-md overflow-hidden border flex-shrink-0 bg-muted">
                                 <img
+                                  key={thumbUrl}
                                   src={thumbUrl}
                                   alt=""
                                   className="h-full w-full object-cover"
+                                  onError={() => queueSilentRefetchFromMediaError()}
                                 />
                               </div>
                             ) : null}

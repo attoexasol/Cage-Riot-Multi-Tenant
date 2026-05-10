@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/app/components/ui/card";
-import { Button } from "@/app/components/ui/button";
+import { Button, buttonVariants } from "@/app/components/ui/button";
+import { cn } from "@/app/components/ui/utils";
 import { Badge } from "@/app/components/ui/badge";
 import { Input } from "@/app/components/ui/input";
 import {
@@ -281,12 +282,7 @@ export function SupportImpersonation() {
                   </p>
                 </div>
               </div>
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={handleEndImpersonation}
-                className="bg-[#ff0050] hover:bg-[#cc0040]"
-              >
+              <Button variant="destructive" size="sm" onClick={handleEndImpersonation}>
                 End Session
               </Button>
             </div>
@@ -542,7 +538,7 @@ export function SupportImpersonation() {
             <AlertDialogAction
               onClick={handleStartImpersonation}
               disabled={!impersonationReason.trim()}
-              className="bg-[#ff0050] hover:bg-[#cc0040]"
+              className={cn(buttonVariants({ variant: "default" }))}
             >
               Start Impersonation
             </AlertDialogAction>

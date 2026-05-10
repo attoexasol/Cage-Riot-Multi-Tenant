@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/app/components/ui/card";
-import { Button } from "@/app/components/ui/button";
+import { Button, buttonVariants } from "@/app/components/ui/button";
 import { Badge } from "@/app/components/ui/badge";
 import { Progress } from "@/app/components/ui/progress";
 import {
@@ -726,7 +726,7 @@ export function StatementImport() {
                 setDeleteDialogOpen(false);
                 setStatementToDelete(null);
               }}
-              className="bg-red-600 hover:bg-red-700 focus:ring-red-600"
+              className={cn(buttonVariants({ variant: "destructive" }))}
             >
               Delete Statement
             </AlertDialogAction>

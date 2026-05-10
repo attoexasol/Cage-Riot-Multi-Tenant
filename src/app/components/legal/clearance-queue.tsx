@@ -549,8 +549,8 @@ export function ClearanceQueue() {
               Cancel
             </Button>
             <Button
+              variant="destructive"
               onClick={confirmReject}
-              className="bg-red-500 hover:bg-red-600"
               disabled={!rejectionReason.trim()}
             >
               <XCircle className="h-4 w-4 mr-2" />

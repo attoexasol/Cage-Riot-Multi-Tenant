@@ -516,7 +516,7 @@ export function OperationsPortal() {
   };
 
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex min-h-0 w-full flex-1 overflow-hidden bg-background">
       {/* Mobile Overlay */}
       {sidebarOpen && (
         <div
@@ -536,15 +536,21 @@ export function OperationsPortal() {
       >
         {/* Logo + collapse toggle */}
         <div className="p-4 border-b flex items-center justify-between gap-2">
-          {!sidebarCollapsed && (
-            <div className="flex items-center gap-3 min-w-0">
-              <img src={logo} alt="Cage Riot" className="h-10 w-10 flex-shrink-0" />
-              <div className="min-w-0">
-                <p className="font-semibold truncate">Cage Riot</p>
-                <p className="text-xs text-muted-foreground truncate">{user?.organizationName ?? "Operations Portal"}</p>
-              </div>
+          <div className={cn("flex items-center gap-3 min-w-0", sidebarCollapsed && "lg:hidden")}>
+            <img src={logo} alt="Cage Riot" className="h-10 w-10 flex-shrink-0 object-contain" />
+            <div className="min-w-0">
+              <p className="font-semibold truncate">Cage Riot</p>
+              <p className="text-xs text-muted-foreground truncate">{user?.organizationName ?? "Operations Portal"}</p>
             </div>
-          )}
+          </div>
+          <div
+            className={cn(
+              "hidden flex-1 justify-center py-0.5",
+              sidebarCollapsed && "lg:flex"
+            )}
+          >
+            <img src={logo} alt="Cage Riot" className="h-9 w-9 flex-shrink-0 object-contain" />
+          </div>
           <div className="flex items-center gap-1 flex-shrink-0">
             <Button
               variant="ghost"

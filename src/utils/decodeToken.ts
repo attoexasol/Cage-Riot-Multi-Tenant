@@ -4,7 +4,8 @@ export interface TokenPayload {
   sub: string;
   role?: string;
   user_role?: string;
-  organization_id: number;
+  /** UUID string or numeric id — login/register body should be preferred when calling org APIs. */
+  organization_id?: number | string;
   org_type: string;
 }
 

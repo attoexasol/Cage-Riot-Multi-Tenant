@@ -616,6 +616,7 @@ export function TenantManagement() {
               Cancel
             </Button>
             <Button
+              variant="destructive"
               onClick={() => {
                 if (tenantToDelete) {
                   setTenants(tenants.filter((t) => t.id !== tenantToDelete.id));
@@ -624,7 +625,6 @@ export function TenantManagement() {
                 setShowDeleteDialog(false);
                 setTenantToDelete(null);
               }}
-              className="bg-red-500 hover:bg-red-600 text-white"
             >
               <Trash2 className="h-4 w-4 mr-2" />
               Delete Tenant

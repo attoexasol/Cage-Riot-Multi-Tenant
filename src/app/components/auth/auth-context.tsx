@@ -1,7 +1,7 @@
 import { registerUser, loginUser, sendOtp, verifyOtp, changePassword } from "@/services/authService";
 import { SESSION_EXPIRED_EVENT } from "@/services/sessionEvents";
 import { persistAuthTokens, clearAuthTokens } from "@/services/tokenStorage";
-import { decodeToken, getRoleFromToken } from "@/utils/decodeToken";
+import { decodeToken, getRoleFromToken, type TokenPayload } from "@/utils/decodeToken";
 import React, { createContext, useContext, useState, useEffect, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -87,6 +87,23 @@ function mapApiRoleToUserRole(apiRole: string): UserRole {
     default:
       return "viewer";
   }
+}
+
+/** Prefer `organization_id` from login/register JSON (UUID); fall back to JWT claim. */
+function resolveOrganizationId(
+  apiOrgId: string | number | null | undefined,
+  decoded: TokenPayload
+): string {
+  if (apiOrgId != null) {
+    const s = String(apiOrgId).trim();
+    if (s !== "") return s;
+  }
+  const j = decoded.organization_id;
+  if (j != null) {
+    const s = String(j).trim();
+    if (s !== "") return s;
+  }
+  return "";
 }
 
 // Mock users database (in production, this would be in your backend)
@@ -200,6 +217,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const parsed = JSON.parse(storedUser) as User;
       const storedOrgName = localStorage.getItem("organization_name");
       const storedUserRole = localStorage.getItem("user_role");
+      const storedOrgId = localStorage.getItem("organization_id")?.trim();
+      if (storedOrgId) {
+        parsed.accountId = storedOrgId;
+      }
       if (storedOrgName && !parsed.organizationName) {
         parsed.organizationName = storedOrgName;
       }
@@ -302,13 +323,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Use role_name first, then user_role (response role for display)
       const displayRoleName = apiRoleName ?? apiUserRole;
 
+      const apiUserName =
+        response.user_name?.trim() ??
+        (response as { userName?: string }).userName?.trim() ??
+        "";
+
       const userData: User = {
         id: decoded.sub,
         email,
-        name: email, // API login does not return name; use email until profile is loaded
+        name: apiUserName,
         role: mappedRole,
         accountType: (decoded.org_type === "standard" ? "standard" : "enterprise") as AccountType,
-        accountId: String(decoded.organization_id ?? response.organization_id),
+        accountId: resolveOrganizationId(response.organization_id, decoded),
         organizationName: apiOrgName,
         roleName: displayRoleName,
         twoFactorEnabled: false,
@@ -353,13 +379,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const apiRole = response.role_name ?? getRoleFromToken(token);
       const mappedRole = mapApiRoleToUserRole(apiRole);
 
+      const apiUserName =
+        response.user_name?.trim() ??
+        (response as { userName?: string }).userName?.trim() ??
+        "";
+
       const userData: User = {
         id: decoded.sub,
         email,
-        name,
+        name: apiUserName || name.trim(),
         role: mappedRole,
         accountType: (decoded.org_type === "standard" ? "standard" : "enterprise") as AccountType,
-        accountId: String(decoded.organization_id ?? response.organization_id),
+        accountId: resolveOrganizationId(response.organization_id, decoded),
         organizationName: response.organization_name,
         roleName: response.role_name,
         twoFactorEnabled: false,
@@ -444,4 +475,17 @@ export function useAuth() {
     throw new Error("useAuth must be used within an AuthProvider");
   }
   return context;
+}
+
+/**
+ * Organization id from login/register (UUID string), for API paths like
+ * `/api/organizations/{organization_id}/users`. Falls back to `localStorage.organization_id`
+ * on the first paint before `auth_user` is rehydrated.
+ */
+export function useOrganizationId(): string | null {
+  const { user } = useAuth();
+  const fromUser = user?.accountId?.trim();
+  if (fromUser) return fromUser;
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("organization_id")?.trim() || null;
 }

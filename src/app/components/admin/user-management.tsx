@@ -517,7 +517,7 @@ export function UserManagement() {
                             </DropdownMenuItem>
                             <DropdownMenuItem
                               onClick={() => handleDeleteUser(user)}
-                              className="text-red-600 cursor-pointer"
+                              className="text-destructive cursor-pointer"
                             >
                               <Trash2 className="h-4 w-4 mr-2" />
                               Delete User
@@ -582,7 +582,7 @@ export function UserManagement() {
                             </DropdownMenuItem>
                             <DropdownMenuItem
                               onClick={() => handleDeleteUser(user)}
-                              className="text-red-600 cursor-pointer"
+                              className="text-destructive cursor-pointer"
                             >
                               <Trash2 className="h-4 w-4 mr-2" />
                               Delete User

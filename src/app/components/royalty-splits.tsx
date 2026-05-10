@@ -182,7 +182,7 @@ export function RoyaltySplits({ releaseId, trackId, level, onSave }: RoyaltySpli
                   variant="ghost"
                   size="sm"
                   onClick={() => removeSplit(split.id)}
-                  className="text-red-500 hover:text-red-600 hover:bg-red-500/10 flex-shrink-0 self-end sm:self-center"
+                  className="text-destructive hover:text-destructive hover:bg-destructive/10 flex-shrink-0 self-end sm:self-center"
                 >
                   <Trash2 className="h-4 w-4" />
                 </Button>

@@ -318,7 +318,7 @@ export function SampleLicenses({ releaseId, trackId, onSave }: SampleLicensesPro
                         variant="ghost"
                         size="sm"
                         onClick={() => removeLicense(license.id)}
-                        className="text-red-500 hover:text-red-600 hover:bg-red-500/10"
+                        className="text-destructive hover:text-destructive hover:bg-destructive/10"
                       >
                         <Trash2 className="h-4 w-4" />
                       </Button>
