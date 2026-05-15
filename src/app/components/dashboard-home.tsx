@@ -601,7 +601,7 @@ export function DashboardHome({ onNavigate }: DashboardHomeProps) {
             </div>
           </CardContent>
         </Card>
-
+              
         {/* Recent Activity */}
         <Card className="lg:col-span-2">
           <CardHeader>

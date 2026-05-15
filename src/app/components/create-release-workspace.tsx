@@ -58,6 +58,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/app/components/ui/utils";
+import { VideoReleaseWorkspace } from "@/app/components/video-release-workspace";
 import { toast } from "sonner";
 import {
   createRelease,
@@ -69,6 +70,7 @@ import {
   getTrack,
   isLikelyServerTrackId,
   listAllTracks,
+  listReleases,
   normalizeReleaseMetadata,
   requestAssetSignedUpload,
   TrackNotFoundError,
@@ -86,6 +88,7 @@ import type {
   ReleaseContributorApi,
   ReleaseListItem,
   ReleaseTrackItem,
+  ReleaseWriterApi,
   TrackAssetInfo,
   UpdateTrackJsonPayload,
 } from "@/services/releaseService";
@@ -295,6 +298,79 @@ function TrackLocalAudioPreview({ file }: { file: File }) {
   );
 }
 
+/**
+ * Audio preview for a remote (R2 presigned) URL.
+ *
+ * R2 presigned URLs are short-lived and signed for a specific HTTP method. When the browser's
+ * `<audio>` element fetches the URL with GET, the server can return **403 Forbidden** if the
+ * signature has expired or wasn't issued for read access. To avoid leaving the user with a
+ * broken-looking player, this component:
+ *  - Tries once to silently refresh the presigned URL by calling `getTrack(serverTrackId)`
+ *    again and swapping in the new `file_path`.
+ *  - If a second 403 happens (or no `serverTrackId` is available), it replaces the player with
+ *    a small "Preview unavailable" hint instead of showing a broken control.
+ */
+function TrackRemoteAudioPreview({
+  initialUrl,
+  serverTrackId,
+}: {
+  initialUrl: string;
+  serverTrackId?: string;
+}) {
+  const [url, setUrl] = useState(initialUrl);
+  const [refreshed, setRefreshed] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setUrl(initialUrl);
+    setRefreshed(false);
+    setFailed(false);
+  }, [initialUrl]);
+
+  const handleError = async () => {
+    if (refreshed || !serverTrackId || !isLikelyServerTrackId(serverTrackId)) {
+      setFailed(true);
+      return;
+    }
+    setRefreshed(true);
+    try {
+      const detail = await getTrack(serverTrackId);
+      const fresh = typeof detail.audio?.file_path === "string" ? detail.audio.file_path.trim() : "";
+      const next = fresh ? releaseArtworkUrlFromFilePath(fresh) ?? fresh : "";
+      if (next && next !== url) {
+        setUrl(next);
+        return;
+      }
+    } catch {
+      /* ignore — fall through to failed state below */
+    }
+    setFailed(true);
+  };
+
+  if (failed) {
+    return (
+      <p className="mt-3 text-xs text-muted-foreground">
+        Audio preview is temporarily unavailable. Try reopening this track in a moment.
+      </p>
+    );
+  }
+
+  return (
+    <audio
+      key={url}
+      controls
+      preload="metadata"
+      className="mt-3 h-9 w-full max-w-md rounded-md"
+      src={url}
+      onError={() => {
+        void handleError();
+      }}
+    >
+      Your browser does not support audio preview.
+    </audio>
+  );
+}
+
 const AUDIO_EXT = new Set(["wav", "mp3", "flac", "m4a", "aac", "ogg", "aiff", "aif", "webm", "ec3"]);
 
 function mimeForSignedUpload(file: File): string {
@@ -495,6 +571,114 @@ function buildContributorsForReleaseApi(
 }
 
 /**
+ * One row of the **effective** Track Contributors list — exactly what is rendered in the
+ * track dialog. The API request must be built from this same shape, never from the raw
+ * `track.trackContributors` + `release.contributors`, so removing a row in the UI guarantees
+ * it disappears from the request too.
+ */
+interface EffectiveTrackContributorRow {
+  row: ContributorRow;
+  inherited: boolean;
+  /** Original release `ContributorRow.id` when `inherited` — used by × to record a track-only hide. */
+  releaseContributorId?: string;
+}
+
+/**
+ * Single source of truth for "what shows in the Track Contributors UI" — used by both the
+ * render layer (`buildTrackContributorView` inside the component) AND the API builder
+ * (`buildTrackContributorsForApi`) below. Whatever the UI hides is also hidden from the
+ * request.
+ */
+function getEffectiveTrackContributorRows(
+  track: TrackWorkspace,
+  releaseContributors: ContributorRow[]
+): EffectiveTrackContributorRow[] {
+  const hidden = new Set(track.trackHiddenReleaseContributorIds);
+  const inherited: EffectiveTrackContributorRow[] = releaseContributors
+    .filter((c) => !hidden.has(c.id))
+    .map((c) => ({
+      row: c,
+      inherited: true,
+      releaseContributorId: c.id,
+    }));
+  const own: EffectiveTrackContributorRow[] = track.trackContributors.map((c) => ({
+    row: c,
+    inherited: false,
+  }));
+  return [...inherited, ...own];
+}
+
+/**
+ * Build the `contributors` array for `POST /api/releases/:id/tracks` and `PUT /api/tracks/:id`
+ * from the same effective view used to render the Track Contributors section. Any row hidden
+ * (or removed) in the UI is automatically excluded from the request.
+ *
+ *  - Primary artist: track-specific if set; otherwise the release primary, unless the user
+ *    hid it via × on this track (`trackHideReleasePrimary`).
+ *  - Additional rows: `getEffectiveTrackContributorRows(track, release.contributors)`.
+ *
+ * Deduplicates on `name|role` (case/whitespace-normalized) so a row appearing in both
+ * inherited and track-only sources isn't sent twice.
+ */
+function buildTrackContributorsForApi(
+  track: TrackWorkspace,
+  release: {
+    mainArtistName: string;
+    mainArtistId: string | null;
+    contributors: ContributorRow[];
+    fallbackPrimaryArtistUserId?: string | null;
+    /** Org roster used to resolve `user_id` for manually-typed contributor names. */
+    orgRoster?: OrgRosterEntry[];
+  }
+): ReleaseContributorApi[] {
+  const out: ReleaseContributorApi[] = [];
+  const seen = new Set<string>();
+  const push = (row: ReleaseContributorApi) => {
+    const key = `${row.name.trim().toLowerCase()}|${row.role.trim().toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(row);
+  };
+  const resolveUid = (explicitId: string | null | undefined, name: string): number | undefined => {
+    const direct = parseUserIdForApi(explicitId ?? null);
+    if (direct !== undefined) return direct;
+    if (release.orgRoster && release.orgRoster.length > 0) {
+      return parseUserIdForApi(resolveOrgRosterUserIdString(name, release.orgRoster));
+    }
+    return undefined;
+  };
+
+  const trackPrimary = track.trackMainArtistName.trim();
+  if (trackPrimary) {
+    const uid = resolveUid(track.trackMainArtistId, trackPrimary);
+    const row: ReleaseContributorApi = { name: trackPrimary, role: "primary_artist" };
+    if (uid !== undefined) row.user_id = uid;
+    push(row);
+  } else if (!track.trackHideReleasePrimary && release.mainArtistName.trim()) {
+    const name = release.mainArtistName.trim();
+    const uid =
+      parseUserIdForApi(release.mainArtistId) ??
+      parseUserIdForApi(release.fallbackPrimaryArtistUserId ?? null) ??
+      (release.orgRoster ? parseUserIdForApi(resolveOrgRosterUserIdString(name, release.orgRoster)) : undefined);
+    const row: ReleaseContributorApi = { name, role: "primary_artist" };
+    if (uid !== undefined) row.user_id = uid;
+    push(row);
+  }
+
+  /** Build from the rendered view — guarantees parity between what the user sees and what's sent. */
+  for (const v of getEffectiveTrackContributorRows(track, release.contributors)) {
+    const n = v.row.name.trim();
+    if (!n) continue;
+    const uid = resolveUid(v.row.userId ?? null, n);
+    const row: ReleaseContributorApi = { name: n, role: contributorRowToApiRole(v.row) };
+    if (uid !== undefined) row.user_id = uid;
+    push(row);
+  }
+
+  return out;
+}
+
+/**
  * Prefer embedded `contributors[].user_id` from GET release when the roster id was not stored in metadata.
  * Only use an explicit `primary_artist` row — credits-only `contributors[]` must not supply the primary id.
  */
@@ -678,6 +862,46 @@ function normalizeWorkspaceContributorsRows(input: unknown): ContributorRow[] {
   return out;
 }
 
+/** Parse `trackContributors` saved inside `workspace_tracks` metadata. */
+function parseTrackContributorsMetadata(raw: unknown): ContributorRow[] {
+  if (Array.isArray(raw)) return normalizeWorkspaceContributorsRows(raw);
+  if (typeof raw === "string" && raw.trim()) {
+    const parsed = tryParseContributorsJsonChain(raw);
+    if (Array.isArray(parsed)) return normalizeWorkspaceContributorsRows(parsed);
+  }
+  return [];
+}
+
+function parseTrackWorkspaceContributorFields(ws: Record<string, unknown>): {
+  trackMainArtistName: string;
+  trackMainArtistId: string | null;
+  trackContributors: ContributorRow[];
+  trackHiddenReleaseContributorIds: string[];
+  trackHideReleasePrimary: boolean;
+} {
+  const trackMainArtistName = String(ws.trackMainArtistName ?? ws.track_main_artist_name ?? "").trim();
+  const idRaw = ws.trackMainArtistId ?? ws.trackMainArtistUserId ?? ws.track_main_artist_user_id;
+  let trackMainArtistId: string | null = null;
+  if (idRaw != null) {
+    const s = String(idRaw).trim();
+    if (s) trackMainArtistId = s;
+  }
+  const trackContributors = parseTrackContributorsMetadata(ws.trackContributors ?? ws.track_contributors);
+  const hidRaw = ws.trackHiddenReleaseContributorIds ?? ws.track_hidden_release_contributor_ids;
+  const trackHiddenReleaseContributorIds = Array.isArray(hidRaw)
+    ? hidRaw.map((x) => String(x ?? "").trim()).filter(Boolean)
+    : [];
+  const hideRelPrim = ws.trackHideReleasePrimary ?? ws.track_hide_release_primary;
+  const trackHideReleasePrimary = hideRelPrim === true || hideRelPrim === "true";
+  return {
+    trackMainArtistName,
+    trackMainArtistId,
+    trackContributors,
+    trackHiddenReleaseContributorIds,
+    trackHideReleasePrimary,
+  };
+}
+
 function tryParseContributorsJsonChain(s: string): unknown {
   let cur: unknown = s.trim();
   for (let d = 0; d < 4 && typeof cur === "string"; d++) {
@@ -744,6 +968,8 @@ interface PublishingRow {
   ownershipPct: number;
   iswc: string;
   publishingType: "copyright_control" | "published";
+  /** Org user id string when resolved from roster or set after picking a contributor name. */
+  userId?: string | null;
 }
 
 interface TrackWorkspace {
@@ -768,6 +994,21 @@ interface TrackWorkspace {
   copyrightYear: string;
   copyrightOwner: string;
   sampleLicenseFiles: UploadFile[];
+  /** Track-level primary (display / metadata); release-level primary is separate. */
+  trackMainArtistName: string;
+  trackMainArtistId: string | null;
+  /** Featuring / With / Remixer / Performer / Credit — same shape as release `contributors`. */
+  trackContributors: ContributorRow[];
+  /**
+   * Release `ContributorRow.id` values hidden from this track's contributor list only (does not
+   * remove them from the release).
+   */
+  trackHiddenReleaseContributorIds: string[];
+  /**
+   * When `true`, the release primary artist is hidden from this track's primary line (it's still
+   * the release primary). User can either pick a new track primary or clear this flag.
+   */
+  trackHideReleasePrimary: boolean;
 }
 
 function emptyTrack(id: string): TrackWorkspace {
@@ -791,11 +1032,82 @@ function emptyTrack(id: string): TrackWorkspace {
     copyrightYear: "",
     copyrightOwner: "",
     sampleLicenseFiles: [],
+    trackMainArtistName: "",
+    trackMainArtistId: null,
+    trackContributors: [],
+    trackHiddenReleaseContributorIds: [],
+    trackHideReleasePrimary: false,
   };
 }
 
 /** One row in the org-user primary-artist picker (API + mock fallback). */
 type OrgRosterEntry = { id: string; name: string; allNames: string[]; roles: string[] };
+
+/** Map Publishing "Role" display text to API snake_case (`songwriter`, `composer`, …). */
+function writerPublishingRoleToApiKey(role: string): string {
+  const t = role.trim().toLowerCase().replace(/\s+/g, "_").replace(/-/g, "_");
+  return t || "songwriter";
+}
+
+function resolveOrgRosterUserIdString(name: string, roster: OrgRosterEntry[]): string | null {
+  const n = name.trim().toLowerCase();
+  if (!n || roster.length === 0) return null;
+  for (const u of roster) {
+    if (u.name.trim().toLowerCase() === n) return u.id;
+    for (const alias of u.allNames) {
+      if (alias.trim().toLowerCase() === n) return u.id;
+    }
+  }
+  return null;
+}
+
+/**
+ * ISWC (International Standard Musical Work Code) — formal layout is `T-DDDDDDDDD-D`:
+ *  - Literal `T`
+ *  - 9 digit work id
+ *  - 1 check digit
+ * Common display variant inserts dots every 3 digits in the work id: `T-DDD.DDD.DDD-D`.
+ *
+ * We accept any combination of whitespace / dashes / dots between the digits and validate by
+ * stripping every non-`T`/non-digit character; the canonical form must then be `T` followed by
+ * exactly 10 digits. The check-digit math is intentionally NOT enforced so legitimate codes from
+ * publishers (where copy-paste sometimes drops/changes a digit) aren't falsely rejected.
+ */
+function isValidIswcFormat(raw: string): boolean {
+  const compact = raw.trim().toUpperCase().replace(/[^T0-9]/g, "");
+  return /^T\d{10}$/.test(compact);
+}
+
+/** Returns a friendly inline error for an ISWC value, or `null` when valid / empty. */
+function getIswcRowError(raw: string): string | null {
+  const v = raw.trim();
+  if (!v) return null;
+  return isValidIswcFormat(v) ? null : "Invalid ISWC. Expected T-DDD.DDD.DDD-D (T + 10 digits).";
+}
+
+function buildWritersForReleaseApi(
+  rows: PublishingRow[],
+  roster: OrgRosterEntry[]
+): ReleaseWriterApi[] | undefined {
+  const mapped = rows
+    .filter((p) => p.name.trim())
+    .map((p) => {
+      let uid = parseUserIdForApi(p.userId ?? null);
+      if (uid === undefined) {
+        uid = parseUserIdForApi(resolveOrgRosterUserIdString(p.name, roster));
+      }
+      const w: ReleaseWriterApi = {
+        name: p.name.trim(),
+        role: writerPublishingRoleToApiKey(p.role),
+        ownership_percentage: Number.isFinite(p.ownershipPct) ? Math.round(p.ownershipPct) : 0,
+        iswc: p.iswc.trim(),
+        publishing_type: p.publishingType,
+      };
+      if (uid !== undefined) w.user_id = uid;
+      return w;
+    });
+  return mapped.length > 0 ? mapped : undefined;
+}
 
 function contributorRowCaption(c: ContributorRow): string {
   switch (c.kind) {
@@ -816,6 +1128,130 @@ function contributorRowCaption(c: ContributorRow): string {
 
 function isFeaturingWithRemixerContributor(c: ContributorRow): boolean {
   return c.kind === "featuring" || c.kind === "with" || c.kind === "remixer";
+}
+
+/**
+ * Each picker option for the Publishing → "Name" combobox.
+ * `key` is unique per row (name + role) so multi-role contributors (e.g. Travis Scott as
+ * `drummer` + `beat_maker`) appear as separate selectable entries.
+ */
+interface PublishingContributorOption {
+  key: string;
+  name: string;
+  role: string;
+  /** Friendly subtitle shown next to the name (e.g. "Drummer", "Featuring", "Primary Artist"). */
+  hint: string;
+  /** Org `user_id` carried from `GET /api/releases.contributors[].user_id` (or Section-1/2 picks). */
+  userId?: string | null;
+}
+
+/**
+ * Builds the dropdown options for the Publishing → Name picker.
+ *
+ * Sources, in priority order:
+ *  - The primary artist on Section 1 (`mainArtistName`) — labeled "Primary Artist".
+ *  - Every additional contributor on Section 2 (`contributors[]`) — labeled with its
+ *    humanized role (uses `contributorRowCaption` for the kind, snake-case detail for the rest).
+ *  - Aggregated rows from the org's other releases (`extraContributors`) — so the picker still
+ *    has data on a fresh Create Release flow before the user has added anyone in Section 2.
+ *
+ * Deduplicates exact `name + role` pairs so the same person under the same role doesn't
+ * appear twice. Different roles for the same person remain separate options on purpose so the
+ * publisher can pick whichever role they're attributing splits to.
+ */
+function buildPublishingContributorOptions(
+  mainArtistName: string,
+  mainArtistUserId: string | null,
+  contributors: ContributorRow[],
+  extraContributors: PublishingContributorOption[] = []
+): PublishingContributorOption[] {
+  const out: PublishingContributorOption[] = [];
+  /** Tracks already-added `name+role` pairs (winners keep the first non-empty `userId` we see). */
+  const seen = new Map<string, PublishingContributorOption>();
+  const push = (name: string, role: string, hint: string, userId?: string | null) => {
+    const cleanName = name.trim();
+    const cleanRole = role.trim();
+    if (!cleanName) return;
+    const key = `${cleanName.toLowerCase()}::${cleanRole.toLowerCase()}`;
+    const existing = seen.get(key);
+    if (existing) {
+      if (!existing.userId && userId) {
+        existing.userId = userId;
+      }
+      return;
+    }
+    const option: PublishingContributorOption = {
+      key,
+      name: cleanName,
+      role: cleanRole,
+      hint: hint.trim() || cleanRole,
+      userId: userId ?? null,
+    };
+    seen.set(key, option);
+    out.push(option);
+  };
+  push(mainArtistName, "Primary Artist", "Primary Artist", mainArtistUserId);
+  for (const c of contributors) {
+    const caption = contributorRowCaption(c);
+    const humanizedRole =
+      c.kind === "performer" || c.kind === "credit"
+        ? humanizeSnakeCaseRoleId(c.roleDetail.trim() || c.kind)
+        : caption;
+    push(c.name, humanizedRole, caption || humanizedRole, c.userId);
+  }
+  for (const e of extraContributors) {
+    push(e.name, e.role, e.hint, e.userId ?? null);
+  }
+  return out;
+}
+
+/**
+ * Pulls every unique contributor (name + humanized role) the org has used on any past release.
+ *
+ * Reads `release.contributors[]` from a `GET /api/releases` response. Each row exposes the
+ * canonical role inside `pivot.role` (e.g. "drummer", "featuring_artist", "primary_artist"), so we
+ * humanize that to "Drummer", "Featuring Artist", etc. for the dropdown subtitle.
+ */
+function aggregateContributorsFromReleaseList(
+  releases: ReleaseListItem[]
+): PublishingContributorOption[] {
+  const out: PublishingContributorOption[] = [];
+  const seen = new Map<string, PublishingContributorOption>();
+  for (const r of releases) {
+    const rec = r as unknown as Record<string, unknown>;
+    const list = rec.contributors;
+    if (!Array.isArray(list)) continue;
+    for (const row of list) {
+      if (!row || typeof row !== "object") continue;
+      const o = mergeJsonApiAttributes(row as Record<string, unknown>);
+      const name = String(o.name ?? "").trim();
+      if (!name) continue;
+      const roleRaw = pickContributorRole(o)
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+      const role = roleRaw ? humanizeSnakeCaseRoleId(roleRaw) : "";
+      const uidVal = (o as { user_id?: unknown }).user_id;
+      const uidParsed =
+        typeof uidVal === "number" && Number.isFinite(uidVal)
+          ? String(uidVal)
+          : typeof uidVal === "string" && uidVal.trim()
+            ? uidVal.trim()
+            : null;
+      const key = `${name.toLowerCase()}::${role.toLowerCase()}`;
+      const existing = seen.get(key);
+      if (existing) {
+        if (!existing.userId && uidParsed) {
+          existing.userId = uidParsed;
+        }
+        continue;
+      }
+      const option: PublishingContributorOption = { key, name, role, hint: role, userId: uidParsed };
+      seen.set(key, option);
+      out.push(option);
+    }
+  }
+  return out;
 }
 
 function pickAudioFile(t: TrackWorkspace): File | null {
@@ -894,10 +1330,15 @@ function unknownTrackPropertiesToApiKeys(tp: unknown): string[] {
  * Sends every field that has a usable value. Empty strings are converted to `null` so the
  * server clears optional metadata; unparseable numbers are sent as `null`. Required
  * `title` and `track_number` are always included by `updateTrack` itself.
+ *
+ * `contributors` (when provided) follows the same shape as release `contributors`: an array
+ * of `{ name, role, user_id? }` with the `primary_artist` row first. Pass `undefined` to leave
+ * the existing contributor list alone.
  */
 function buildTrackUpdatePayloadFromWorkspace(
   t: TrackWorkspace,
-  trackNumber: number
+  trackNumber: number,
+  contributors?: ReleaseContributorApi[]
 ): UpdateTrackJsonPayload {
   const cyRaw = t.copyrightYear.trim();
   const cyParsed = cyRaw ? parseInt(cyRaw, 10) : NaN;
@@ -917,6 +1358,7 @@ function buildTrackUpdatePayloadFromWorkspace(
     copyright_year: Number.isFinite(cyParsed) ? cyParsed : null,
     copyright_owner: t.copyrightOwner.trim() || null,
     isrc: isrcVal ? isrcVal : null,
+    contributors,
   };
 }
 
@@ -944,7 +1386,8 @@ function parsePreviewStartToSeconds(raw: string): number {
 async function createWorkspaceTrackOnServer(
   releaseId: string,
   t: TrackWorkspace,
-  trackNumber: number
+  trackNumber: number,
+  contributors?: ReleaseContributorApi[]
 ): Promise<CreateTrackResponse> {
   const audioF = pickAudioFile(t);
   if (!audioF) {
@@ -979,6 +1422,7 @@ async function createWorkspaceTrackOnServer(
     throw new Error("Copyright year is required");
   }
 
+  const isrcTrim = t.isrc?.trim() ?? "";
   const payload: CreateTrackJsonPayload = {
     title: displayTrackTitleForApi(t),
     track_number: trackNumber,
@@ -998,6 +1442,9 @@ async function createWorkspaceTrackOnServer(
     copyright_year: cy,
     copyright_owner: t.copyrightOwner.trim(),
     ...sampleExtra,
+    /** Always assign — service-layer omits the key from the HTTP body when the list is empty. */
+    contributors: contributors ?? [],
+    ...(isrcTrim ? { isrc: isrcTrim } : {}),
   };
   return createReleaseTrackJson(releaseId, payload);
 }
@@ -1081,6 +1528,8 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
   const [secondaryGenre, setSecondaryGenre] = useState("");
   const [mainArtistName, setMainArtistName] = useState("");
   const [mainArtistId, setMainArtistId] = useState<string | null>(null);
+  /** `"release"` = Section 1 primary; otherwise `TrackWorkspace.id` for track-level primary in the track dialog. */
+  const [primaryArtistPickTarget, setPrimaryArtistPickTarget] = useState<"release" | string>("release");
   const [contributors, setContributors] = useState<ContributorRow[]>([]);
   /**
    * Pivot ids of contributor rows the user removed during this edit session. Sent as
@@ -1095,6 +1544,15 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
   }, []);
   const [tracks, setTracks] = useState<TrackWorkspace[]>(() => [emptyTrack("1")]);
   const [publishing, setPublishing] = useState<PublishingRow[]>([]);
+  /** Id of the publishing row whose Name combobox is currently open (null = all closed). */
+  const [publishingPickerOpenId, setPublishingPickerOpenId] = useState<string | null>(null);
+  /** Per-row anchor refs so the popover keeps focus when clicking the dropdown chevron. */
+  const publishingAnchorRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  /**
+   * Org-wide contributor history aggregated from `GET /api/releases` — feeds the Publishing
+   * combobox on a fresh Create Release flow before any Section-2 contributors are added.
+   */
+  const [orgContributorOptions, setOrgContributorOptions] = useState<PublishingContributorOption[]>([]);
 
   const [coverFile, setCoverFile] = useState<File | null>(null);
   const [coverPreviewUrl, setCoverPreviewUrl] = useState<string | null>(null);
@@ -1110,6 +1568,8 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
   const [newArtistName, setNewArtistName] = useState("");
 
   const [addContributorKind, setAddContributorKind] = useState<ContributorKind | null>(null);
+  /** When set, new contributors go onto this track's `trackContributors` instead of the release list. */
+  const [contributorAddForTrackId, setContributorAddForTrackId] = useState<string | null>(null);
   const [contributorNameDraft, setContributorNameDraft] = useState("");
   /** Pending org roster selections in Add contributor (multi-select before Add). */
   const [contributorOrgPicks, setContributorOrgPicks] = useState<{ id: string; name: string }[]>([]);
@@ -1165,10 +1625,20 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
     if (addContributorKind !== "credit") setCreditRoleMenuOpen(false);
   }, [addContributorKind]);
 
+  /**
+   * Roster powers `user_id` resolution for both the Contributor dialog and the Publishing → Name
+   * picker. Trigger the fetch whenever:
+   *  - Section 1 artist dialog is open.
+   *  - Section 2 contributor picker is open for an org-listed kind.
+   *  - The Publishing combobox is open, or any publishing row exists (so manually-typed names
+   *    can still resolve to a `user_id` when the writer matches the org roster).
+   */
   const needsOrgRosterFetch =
     !!organizationId &&
     (artistDialogOpen ||
-      (!!addContributorKind && CONTRIBUTOR_ORG_LIST_KINDS.includes(addContributorKind)));
+      (!!addContributorKind && CONTRIBUTOR_ORG_LIST_KINDS.includes(addContributorKind)) ||
+      publishingPickerOpenId !== null ||
+      publishing.length > 0);
 
   useEffect(() => {
     if (!needsOrgRosterFetch) return;
@@ -1199,6 +1669,29 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
       cancelled = true;
     };
   }, [needsOrgRosterFetch, organizationId]);
+
+  /**
+   * Fetch the org's release history once on mount to populate the Publishing → Name combobox.
+   * We aggregate every distinct `(name, role)` pair from `release.contributors[]` so the picker
+   * has data on a fresh Create Release flow before any Section-2 contributors are added.
+   *
+   * Failures are silent — the combobox simply falls back to in-form contributors + primary artist.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    void listReleases()
+      .then((rows) => {
+        if (cancelled) return;
+        setOrgContributorOptions(aggregateContributorsFromReleaseList(rows));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setOrgContributorOptions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (isEditing) return;
@@ -1298,7 +1791,37 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
           const pubRaw = flat.workspace_publishing?.trim() || flat.workspacePublishing?.trim() || "";
           if (pubRaw) {
             const pubParsed = JSON.parse(pubRaw) as unknown;
-            if (Array.isArray(pubParsed)) publishingRows = pubParsed as PublishingRow[];
+            if (Array.isArray(pubParsed)) {
+              publishingRows = pubParsed.map((raw, idx): PublishingRow => {
+                if (!raw || typeof raw !== "object") {
+                  return {
+                    id: `p-${idx}`,
+                    name: "",
+                    role: "",
+                    ownershipPct: 0,
+                    iswc: "",
+                    publishingType: "copyright_control",
+                  };
+                }
+                const o = raw as Record<string, unknown>;
+                const ptRaw = o.publishingType ?? o.publishing_type;
+                const publishingType: PublishingRow["publishingType"] =
+                  ptRaw === "published" ? "published" : "copyright_control";
+                const pctRaw = o.ownershipPct ?? o.ownership_pct ?? o.ownership_percentage;
+                const pct = typeof pctRaw === "number" ? pctRaw : parseFloat(String(pctRaw ?? "0"));
+                const uidSrc = o.userId ?? o.user_id;
+                return {
+                  id: String(o.id ?? `p-${idx}`),
+                  name: String(o.name ?? ""),
+                  role: String(o.role ?? ""),
+                  ownershipPct: Number.isFinite(pct) ? pct : 0,
+                  iswc: String(o.iswc ?? ""),
+                  publishingType,
+                  userId:
+                    uidSrc != null && String(uidSrc).trim() ? String(uidSrc).trim() : null,
+                };
+              });
+            }
           }
         } catch {
           publishingRows = [];
@@ -1332,6 +1855,7 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
             ].filter((f): f is UploadFile => f != null);
             const ws = wsRows[index] ?? {};
             const src = String(ws.source ?? "upload") === "catalog" ? "catalog" : "upload";
+            const tcFields = parseTrackWorkspaceContributorFields(ws as Record<string, unknown>);
             return {
               ...emptyTrack(t.id),
               serverTrackId: t.id,
@@ -1386,6 +1910,11 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
               audioFormat: String(ws.audioFormat ?? "stereo") === "atmos" ? "atmos" : "stereo",
               files,
               statusLabel: "In catalog",
+              trackMainArtistName: tcFields.trackMainArtistName,
+              trackMainArtistId: tcFields.trackMainArtistId,
+              trackContributors: tcFields.trackContributors,
+              trackHiddenReleaseContributorIds: tcFields.trackHiddenReleaseContributorIds,
+              trackHideReleasePrimary: tcFields.trackHideReleasePrimary,
             };
           });
         } catch {
@@ -1490,6 +2019,11 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
           copyrightYear: t.copyrightYear,
           copyrightOwner: t.copyrightOwner,
           audioFormat: t.audioFormat,
+          trackMainArtistName: t.trackMainArtistName,
+          trackMainArtistId: t.trackMainArtistId,
+          trackContributors: t.trackContributors,
+          trackHiddenReleaseContributorIds: t.trackHiddenReleaseContributorIds,
+          trackHideReleasePrimary: t.trackHideReleasePrimary,
         }))
       ),
     };
@@ -1527,6 +2061,7 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
       scheduled_release_date: scheduledRaw,
       primary_genre: primaryGenre.trim(),
       secondary_genre: secondaryGenre.trim() || null,
+      writers: buildWritersForReleaseApi(publishing, orgRoster),
     };
   };
 
@@ -1543,6 +2078,19 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
     let created = 0;
     let updated = 0;
     let skippedAudioMissing = 0;
+    /**
+     * Shared helper for both the edit and create branches — builds the API `contributors`
+     * array for one track using current Section-1/2 release state as the inherited base.
+     * Passes the org roster so manually-typed names still resolve to a `user_id`.
+     */
+    const trackContribsForApi = (t: TrackWorkspace): ReleaseContributorApi[] =>
+      buildTrackContributorsForApi(t, {
+        mainArtistName,
+        mainArtistId,
+        contributors,
+        fallbackPrimaryArtistUserId: user?.id ?? null,
+        orgRoster,
+      });
     if (editingId) {
       await updateRelease(editingId, fields);
       /** PUT succeeded — drop the queued pivot ids so a follow-up save doesn't re-send them. */
@@ -1562,6 +2110,7 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
         const titleForApi = displayTrackTitleForApi(t);
         const serverId = t.serverTrackId?.trim();
         const isCatalogAttach = t.source === "catalog" && Boolean(serverId) && !audioF;
+        const trackContribs = trackContribsForApi(t);
         if (isCatalogAttach && serverId) {
           try {
             await attachExistingTrackToRelease(editingId, serverId);
@@ -1575,17 +2124,17 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
           if (artF) {
             await uploadTrackAsset(serverId, { audioFile: null, artworkFile: artF });
           }
-          await updateTrack(serverId, buildTrackUpdatePayloadFromWorkspace(t, n));
+          await updateTrack(serverId, buildTrackUpdatePayloadFromWorkspace(t, n, trackContribs));
           continue;
         }
         if (serverId) {
-          await updateTrack(serverId, buildTrackUpdatePayloadFromWorkspace(t, n));
+          await updateTrack(serverId, buildTrackUpdatePayloadFromWorkspace(t, n, trackContribs));
           if (audioF || artF) {
             await uploadTrackAsset(serverId, { audioFile: audioF, artworkFile: artF });
           }
           updated += 1;
         } else if (audioF) {
-          const createdRow = await createWorkspaceTrackOnServer(editingId, t, n);
+          const createdRow = await createWorkspaceTrackOnServer(editingId, t, n, trackContribs);
           const cid = createdRow.id?.trim();
           if (cid) {
             created += 1;
@@ -1673,7 +2222,10 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
             await uploadTrackAsset(serverId, { audioFile: null, artworkFile: artF });
           }
           try {
-            await updateTrack(serverId, buildTrackUpdatePayloadFromWorkspace(t, i + 1));
+            await updateTrack(
+              serverId,
+              buildTrackUpdatePayloadFromWorkspace(t, i + 1, trackContribsForApi(t))
+            );
           } catch {
             /* non-fatal: attach already linked the track */
           }
@@ -1694,7 +2246,12 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
           }
           continue;
         }
-        const createdRow = await createWorkspaceTrackOnServer(newReleaseId, t, i + 1);
+        const createdRow = await createWorkspaceTrackOnServer(
+          newReleaseId,
+          t,
+          i + 1,
+          trackContribsForApi(t)
+        );
         const tid = createdRow.id?.trim();
         if (artF && tid) {
           await uploadTrackAsset(tid, { audioFile: null, artworkFile: artF });
@@ -1826,9 +2383,22 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
         err[`track-${t.id}-audio`] = "Audio file required for uploaded tracks.";
       }
     }
-    const pubSum = publishing.reduce((s, p) => s + (Number.isFinite(p.ownershipPct) ? p.ownershipPct : 0), 0);
+    const pubSum = publishing.reduce(
+      (s, p) => s + (Number.isFinite(p.ownershipPct) ? p.ownershipPct : 0),
+      0
+    );
     if (publishing.length > 0 && Math.round(pubSum) !== 100) {
-      err.publishing = `Writer / publisher ownership must total 100% (currently ${pubSum}).`;
+      const delta = Math.round(pubSum) - 100;
+      err.publishing =
+        delta > 0
+          ? `Writer / publisher ownership exceeds 100% by ${delta}%. Reduce the splits to total exactly 100%.`
+          : `Writer / publisher ownership is below 100% by ${Math.abs(delta)}%. Add splits so the total is exactly 100%.`;
+    }
+    for (const row of publishing) {
+      const iswcErr = getIswcRowError(row.iswc);
+      if (iswcErr) {
+        err[`pub-${row.id}-iswc`] = iswcErr;
+      }
     }
     setFieldErrors(err);
     return Object.keys(err).length === 0;
@@ -1887,8 +2457,9 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
     }
   };
 
-  const addContributor = (kind: ContributorKind) => {
+  const addContributor = (kind: ContributorKind, forTrackId?: string | null) => {
     setAddContributorKind(kind);
+    setContributorAddForTrackId(forTrackId ?? null);
     setContributorNameDraft("");
     setContributorOrgPicks([]);
     setContributorOrgSearch("");
@@ -1897,33 +2468,43 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
 
   const confirmContributor = () => {
     if (!addContributorKind) return;
+    const tid = contributorAddForTrackId;
     if (organizationId && CONTRIBUTOR_ORG_LIST_KINDS.includes(addContributorKind)) {
       if (contributorOrgPicks.length === 0) return;
       const ts = Date.now();
-      setContributors((c) => [
-        ...c,
-        ...contributorOrgPicks.map((p, i) => ({
-          id: `c-${ts}-${i}-${p.id}`,
-          kind: addContributorKind,
-          name: p.name,
-          roleDetail: contributorRoleDraft.trim(),
-          userId: p.id,
-        })),
-      ]);
+      const newRows = contributorOrgPicks.map((p, i) => ({
+        id: `c-${ts}-${i}-${p.id}`,
+        kind: addContributorKind,
+        name: p.name,
+        roleDetail: contributorRoleDraft.trim(),
+        userId: p.id,
+      }));
+      if (tid) {
+        setTracks((trs) =>
+          trs.map((t) => (t.id === tid ? { ...t, trackContributors: [...t.trackContributors, ...newRows] } : t))
+        );
+      } else {
+        setContributors((c) => [...c, ...newRows]);
+      }
     } else {
       if (!contributorNameDraft.trim()) return;
-      setContributors((c) => [
-        ...c,
-        {
-          id: `c-${Date.now()}`,
-          kind: addContributorKind,
-          name: contributorNameDraft.trim(),
-          roleDetail: contributorRoleDraft.trim(),
-          userId: null,
-        },
-      ]);
+      const row: ContributorRow = {
+        id: `c-${Date.now()}`,
+        kind: addContributorKind,
+        name: contributorNameDraft.trim(),
+        roleDetail: contributorRoleDraft.trim(),
+        userId: null,
+      };
+      if (tid) {
+        setTracks((trs) =>
+          trs.map((t) => (t.id === tid ? { ...t, trackContributors: [...t.trackContributors, row] } : t))
+        );
+      } else {
+        setContributors((c) => [...c, row]);
+      }
     }
     setAddContributorKind(null);
+    setContributorAddForTrackId(null);
     setContributorOrgPicks([]);
     setContributorNameDraft("");
     markDirty();
@@ -2029,6 +2610,37 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
   const activeTrack = tracks.find((t) => t.id === trackDialogId);
   const activeTrackAudio = activeTrack?.files.find((f) => f.type === "audio");
 
+  /**
+   * Track Contributors view = release-level contributors (minus per-track hidden ids) +
+   * track-specific additions. Hiding a release row here only appends to
+   * `trackHiddenReleaseContributorIds`; it does not change the release Contributors section.
+   *
+   * Delegates to the top-level `getEffectiveTrackContributorRows` so the request body built
+   * by `buildTrackContributorsForApi` is guaranteed to match what is rendered here.
+   */
+  type TrackContributorView = EffectiveTrackContributorRow;
+  const buildTrackContributorView = (track: TrackWorkspace): TrackContributorView[] =>
+    getEffectiveTrackContributorRows(track, contributors).map((v) =>
+      /** Prefix inherited row ids so React keys can't collide with track-only rows. */
+      v.inherited ? { ...v, row: { ...v.row, id: `rel:${v.row.id}` } } : v
+    );
+  /**
+   * Effective track primary artist:
+   *  - If the user picked a track-specific primary, use it (`inherited = false`).
+   *  - Otherwise fall back to the release primary unless the user hid it via × on this track
+   *    (`trackHideReleasePrimary` — does not affect other tracks or the release itself).
+   */
+  const effectiveTrackPrimary = activeTrack
+    ? (() => {
+        const trackName = activeTrack.trackMainArtistName.trim();
+        if (trackName) return { name: trackName, inherited: false };
+        if (activeTrack.trackHideReleasePrimary) return { name: "", inherited: false };
+        const relName = mainArtistName.trim();
+        return { name: relName, inherited: Boolean(relName) };
+      })()
+    : { name: "", inherited: false };
+  const activeTrackContributorView = activeTrack ? buildTrackContributorView(activeTrack) : [];
+
   useEffect(() => {
     if (!isEditing || hydratingEdit || !trackDialogId) return;
     const row = tracksRef.current.find((t) => t.id === trackDialogId);
@@ -2092,6 +2704,22 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
   }, [hydratingEdit, isEditing, tracks, navigate]);
 
   const publishingTotal = publishing.reduce((s, p) => s + p.ownershipPct, 0);
+
+  /**
+   * Options for the Publishing → Name combobox. Rebuilt whenever the primary artist, any
+   * additional contributor, or the org-wide contributor list changes so newly-added rows are
+   * immediately pickable.
+   */
+  const publishingContributorOptions = useMemo(
+    () =>
+      buildPublishingContributorOptions(
+        mainArtistName,
+        mainArtistId,
+        contributors,
+        orgContributorOptions
+      ),
+    [mainArtistName, mainArtistId, contributors, orgContributorOptions]
+  );
 
   function addAudioToTrack(trackId: string, fileList: FileList | null) {
     const file = fileList?.[0];
@@ -2158,10 +2786,16 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
       <div className="p-4 sm:p-5 md:p-6 lg:p-8 space-y-6 sm:space-y-8 overflow-x-hidden max-w-[1800px] mx-auto w-full">
         <div>
           <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">
-            {isEditing ? "Edit release" : "Create Release (Audio Workspace)"}
+            {isEditing
+              ? "Edit release"
+              : workspaceKind === "video"
+                ? "Create video release"
+                : "Create audio release"}
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Structured metadata, tracks, and publishing  save drafts anytime.
+            {workspaceKind === "video"
+              ? "Professional video delivery for VEVO and YouTube save drafts anytime."
+              : "Structured metadata, tracks, and publishing — save drafts anytime."}
           </p>
           {hydratingEdit && (
             <p className="text-sm text-muted-foreground mt-2 flex items-center gap-2">
@@ -2171,48 +2805,58 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
           )}
         </div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>What are you creating?</CardTitle>
-            <CardDescription>Audio is fully supported; video is coming soon.</CardDescription>
+        <Card className="overflow-hidden">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">Release type</CardTitle>
+            <CardDescription>Choose audio or video each has a tailored delivery workflow.</CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-wrap gap-3">
-            <Button
-              type="button"
-              variant={workspaceKind === "audio" ? "default" : "outline"}
-              className={workspaceKind === "audio" ? "bg-[#ff0050] hover:bg-[#cc0040]" : ""}
-              onClick={() => {
-                setWorkspaceKind("audio");
-                markDirty();
-              }}
+          <CardContent>
+            <div
+              role="tablist"
+              aria-label="Release type"
+              className="inline-flex w-full sm:w-auto rounded-lg border border-border/80 bg-muted/40 p-1"
             >
-              <Music className="h-4 w-4 mr-2" />
-              Audio
-            </Button>
-            <Button
-              type="button"
-              variant={workspaceKind === "video" ? "default" : "outline"}
-              className={workspaceKind === "video" ? "bg-[#ff0050] hover:bg-[#cc0040]" : ""}
-              onClick={() => {
-                setWorkspaceKind("video");
-                markDirty();
-              }}
-            >
-              <Video className="h-4 w-4 mr-2" />
-              Video
-            </Button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={workspaceKind === "audio"}
+                className={cn(
+                  "flex-1 sm:flex-none flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-all",
+                  workspaceKind === "audio"
+                    ? "bg-[#ff0050] text-white shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+                onClick={() => {
+                  setWorkspaceKind("audio");
+                  markDirty();
+                }}
+              >
+                <Music className="h-4 w-4 shrink-0" />
+                Audio release
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={workspaceKind === "video"}
+                className={cn(
+                  "flex-1 sm:flex-none flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-all",
+                  workspaceKind === "video"
+                    ? "bg-[#ff0050] text-white shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+                onClick={() => {
+                  setWorkspaceKind("video");
+                  markDirty();
+                }}
+              >
+                <Video className="h-4 w-4 shrink-0" />
+                Video release
+              </button>
+            </div>
           </CardContent>
         </Card>
 
-        {workspaceKind === "video" && (
-          <Card className="border-dashed">
-            <CardContent className="py-10 text-center text-muted-foreground">
-              <Video className="h-10 w-10 mx-auto mb-3 opacity-50" />
-              <p className="font-medium text-foreground">Video workspace</p>
-              <p className="text-sm mt-1">This path will mirror the audio workflow in a future update.</p>
-            </CardContent>
-          </Card>
-        )}
+        {workspaceKind === "video" && <VideoReleaseWorkspace editReleaseId={editReleaseId} />}
 
         {workspaceKind === "audio" && (
           <>
@@ -2467,7 +3111,15 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                 <div className="space-y-3">
                   <div className="flex flex-wrap items-center gap-2">
                     <Label className="text-base">Primary artist *</Label>
-                    <Button type="button" size="sm" variant="outline" onClick={() => setArtistDialogOpen(true)}>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setPrimaryArtistPickTarget("release");
+                        setArtistDialogOpen(true);
+                      }}
+                    >
                       <Plus className="h-4 w-4 mr-1" />
                       Add main primary artist
                     </Button>
@@ -2710,7 +3362,9 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                     <FileAudio className="h-8 w-8 text-[#ff0050] shrink-0 hidden sm:block" />
                     <div className="flex-1 min-w-0 space-y-1">
                       <p className="font-medium truncate">{t.title || "Untitled track"}</p>
-                      <p className="text-xs text-muted-foreground truncate">{mainArtistName || "—"}</p>
+                      <p className="text-xs text-muted-foreground truncate">
+                        {(t.trackMainArtistName || mainArtistName).trim() || "—"}
+                      </p>
                       <div className="flex flex-wrap gap-2 text-xs">
                         <span>ISRC: {t.isrc || "—"}</span>
                         <Badge variant="outline">{t.statusLabel}</Badge>
@@ -2790,27 +3444,176 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                 </Button>
               </CardHeader>
               <CardContent className="space-y-3">
+                {/**
+                 * Running total — visible at all times.
+                 *  - Green when exactly 100%.
+                 *  - Red (destructive) when there is at least one writer row and the total drifts.
+                 *  - Muted when the section is empty (no warning needed yet).
+                 */}
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-muted-foreground">Running total</span>
-                  <span className={cn("font-medium", Math.round(publishingTotal) === 100 ? "text-green-600" : "")}>
+                  <span
+                    className={cn(
+                      "font-medium",
+                      publishing.length === 0
+                        ? ""
+                        : Math.round(publishingTotal) === 100
+                          ? "text-green-600"
+                          : "text-destructive"
+                    )}
+                  >
                     {publishingTotal}%
                   </span>
                 </div>
+                {publishing.length > 0 && Math.round(publishingTotal) !== 100 && (
+                  <p className="text-sm text-destructive">
+                    {Math.round(publishingTotal) > 100
+                      ? `Total ownership exceeds 100% by ${Math.round(publishingTotal) - 100}%. Adjust the splits so the total equals 100%.`
+                      : `Total ownership is below 100% by ${100 - Math.round(publishingTotal)}%. Adjust the splits so the total equals 100%.`}
+                  </p>
+                )}
                 {validationAttempt && fieldErrors.publishing && (
                   <p className="text-sm text-destructive">{fieldErrors.publishing}</p>
                 )}
-                {publishing.map((row) => (
+                {publishing.map((row) => {
+                  /**
+                   * Filter contributor suggestions by the current name input — keeps the dropdown
+                   * useful even when the user starts typing a name not in the list (free-typing
+                   * stays supported; selecting a suggestion overwrites both Name and Role).
+                   */
+                  const trimmedName = row.name.trim().toLowerCase();
+                  const filteredOptions = trimmedName
+                    ? publishingContributorOptions.filter((opt) =>
+                        opt.name.toLowerCase().includes(trimmedName)
+                      )
+                    : publishingContributorOptions;
+                  const isOpen = publishingPickerOpenId === row.id;
+                  return (
                   <div key={row.id} className="grid sm:grid-cols-2 lg:grid-cols-6 gap-2 items-end border rounded-lg p-3">
                     <div className="lg:col-span-2">
                       <Label className="text-xs">Name</Label>
-                      <Input
-                        value={row.name}
-                        onChange={(e) => {
-                          const v = e.target.value;
-                          setPublishing((p) => p.map((x) => (x.id === row.id ? { ...x, name: v } : x)));
-                          markDirty();
-                        }}
-                      />
+                      <Popover
+                        open={isOpen}
+                        onOpenChange={(open) => setPublishingPickerOpenId(open ? row.id : null)}
+                      >
+                        <PopoverAnchor asChild>
+                          <div
+                            ref={(el) => {
+                              publishingAnchorRefs.current[row.id] = el;
+                            }}
+                            className="relative w-full"
+                          >
+                            <Input
+                              className="pr-10"
+                              autoComplete="off"
+                              placeholder={
+                                publishingContributorOptions.length > 0
+                                  ? "Pick a contributor or type"
+                                  : "Writer or publisher name"
+                              }
+                              value={row.name}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setPublishing((p) =>
+                                  p.map((x) => (x.id === row.id ? { ...x, name: v } : x))
+                                );
+                                if (publishingContributorOptions.length > 0) {
+                                  setPublishingPickerOpenId(row.id);
+                                }
+                                markDirty();
+                              }}
+                              onFocus={() => {
+                                if (publishingContributorOptions.length > 0) {
+                                  setPublishingPickerOpenId(row.id);
+                                }
+                              }}
+                            />
+                            {publishingContributorOptions.length > 0 && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="absolute right-0 top-0 h-9 w-9 shrink-0 text-muted-foreground hover:text-foreground"
+                                aria-expanded={isOpen}
+                                aria-label="Show contributor list"
+                                onPointerDown={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setPublishingPickerOpenId((cur) => (cur === row.id ? null : row.id));
+                                }}
+                              >
+                                <ChevronDown className="size-4 opacity-70" />
+                              </Button>
+                            )}
+                          </div>
+                        </PopoverAnchor>
+                        {filteredOptions.length > 0 && (
+                          <PopoverContent
+                            align="start"
+                            sideOffset={4}
+                            className="max-h-72 w-[var(--radix-popover-anchor-width)] min-w-[16rem] overflow-y-auto p-0 shadow-md"
+                            onOpenAutoFocus={(e) => e.preventDefault()}
+                            onInteractOutside={(e) => {
+                              const anchor = publishingAnchorRefs.current[row.id];
+                              if (anchor?.contains(e.target as Node)) {
+                                e.preventDefault();
+                              }
+                            }}
+                            onFocusOutside={(e) => {
+                              const anchor = publishingAnchorRefs.current[row.id];
+                              if (anchor?.contains(e.target as Node)) {
+                                e.preventDefault();
+                              }
+                            }}
+                          >
+                            <p className="px-2 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                              Pick from contributors
+                            </p>
+                            <div className="flex flex-col gap-px px-1 pb-1">
+                              {filteredOptions.map((opt) => (
+                                <button
+                                  key={opt.key}
+                                  type="button"
+                                  className="rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground"
+                                  onClick={() => {
+                                    /**
+                                     * Priority for `user_id` resolution on pick:
+                                     *  1. The option's own `userId` (captured from
+                                     *     `GET /api/releases.contributors[].user_id` or set on
+                                     *     Section-1/2 picks) — no roster fetch required.
+                                     *  2. Roster name match — covers manually-typed names where
+                                     *     the org roster is already loaded.
+                                     *  3. Existing `userId` on the row (keeps prior pick intact).
+                                     */
+                                    const rosterId = resolveOrgRosterUserIdString(opt.name, orgRoster);
+                                    const resolvedUserId =
+                                      opt.userId ?? rosterId ?? row.userId ?? null;
+                                    setPublishing((p) =>
+                                      p.map((x) =>
+                                        x.id === row.id
+                                          ? {
+                                              ...x,
+                                              name: opt.name,
+                                              role: opt.role,
+                                              userId: resolvedUserId,
+                                            }
+                                          : x
+                                      )
+                                    );
+                                    setPublishingPickerOpenId(null);
+                                    markDirty();
+                                  }}
+                                >
+                                  <span className="font-medium">{opt.name}</span>
+                                  {opt.hint && (
+                                    <span className="ml-2 text-xs text-muted-foreground">{opt.hint}</span>
+                                  )}
+                                </button>
+                              ))}
+                            </div>
+                          </PopoverContent>
+                        )}
+                      </Popover>
                     </div>
                     <div>
                       <Label className="text-xs">Role</Label>
@@ -2841,14 +3644,32 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                     </div>
                     <div>
                       <Label className="text-xs">ISWC</Label>
+                      {/**
+                       * Live ISWC validation — error appears as soon as the field is non-empty and
+                       * the value doesn't match `T-DDD.DDD.DDD-D` (or any equivalent canonical
+                       * `T` + 10 digits form). The submission flow blocks Continue when invalid.
+                       */}
                       <Input
                         value={row.iswc}
+                        placeholder="T-123.456.789-0"
+                        aria-invalid={Boolean(getIswcRowError(row.iswc))}
+                        className={cn(
+                          getIswcRowError(row.iswc) &&
+                            "border-destructive focus-visible:ring-destructive"
+                        )}
                         onChange={(e) => {
                           const v = e.target.value;
-                          setPublishing((p) => p.map((x) => (x.id === row.id ? { ...x, iswc: v } : x)));
+                          setPublishing((p) =>
+                            p.map((x) => (x.id === row.id ? { ...x, iswc: v } : x))
+                          );
                           markDirty();
                         }}
                       />
+                      {getIswcRowError(row.iswc) && (
+                        <p className="mt-1 text-xs text-destructive">
+                          {getIswcRowError(row.iswc)}
+                        </p>
+                      )}
                     </div>
                     <div className="flex gap-2">
                       <div className="flex-1">
@@ -2880,6 +3701,9 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                         className="mb-0.5"
                         onClick={() => {
                           setPublishing((p) => p.filter((x) => x.id !== row.id));
+                          /** Close any open dropdown anchored to the row being removed. */
+                          setPublishingPickerOpenId((cur) => (cur === row.id ? null : cur));
+                          delete publishingAnchorRefs.current[row.id];
                           markDirty();
                         }}
                       >
@@ -2887,7 +3711,8 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                       </Button>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </CardContent>
             </Card>
 
@@ -2923,14 +3748,24 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
         )}
 
         {/* Artist picker — scrollable list so all org users (e.g. 40+) are reachable */}
-        <Dialog open={artistDialogOpen} onOpenChange={setArtistDialogOpen}>
+        <Dialog
+          open={artistDialogOpen}
+          onOpenChange={(o) => {
+            setArtistDialogOpen(o);
+            if (!o) setPrimaryArtistPickTarget("release");
+          }}
+        >
           <DialogContent
             className={cn(
               "!flex !max-h-[min(90dvh,720px)] !flex-col !gap-3 !overflow-hidden p-6 sm:max-w-lg"
             )}
           >
             <DialogHeader className="shrink-0">
-              <DialogTitle>Select main primary artist</DialogTitle>
+              <DialogTitle>
+                {primaryArtistPickTarget === "release"
+                  ? "Select main primary artist"
+                  : "Select track primary artist"}
+              </DialogTitle>
               <DialogDescription>
                 {organizationId
                   ? "Choose from users in your organization, or create a new artist name."
@@ -2971,8 +3806,25 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                       variant="ghost"
                       className="w-full h-auto min-h-9 justify-start gap-0 px-3 py-2 whitespace-normal"
                       onClick={() => {
-                        setMainArtistId(a.id);
-                        setMainArtistName(a.name);
+                        if (primaryArtistPickTarget === "release") {
+                          setMainArtistId(a.id);
+                          setMainArtistName(a.name);
+                        } else {
+                          const pickTid = primaryArtistPickTarget;
+                          setTracks((ts) =>
+                            ts.map((x) =>
+                              x.id === pickTid
+                                ? {
+                                    ...x,
+                                    trackMainArtistId: a.id,
+                                    trackMainArtistName: a.name,
+                                    /** Picking a new primary clears any prior "hide release primary" intent. */
+                                    trackHideReleasePrimary: false,
+                                  }
+                                : x
+                            )
+                          );
+                        }
                         setArtistDialogOpen(false);
                         markDirty();
                       }}
@@ -3035,8 +3887,25 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                 onClick={() => {
                   const n = newArtistName.trim();
                   if (!n) return;
-                  setMainArtistId(`new-${Date.now()}`);
-                  setMainArtistName(n);
+                  const newId = `new-${Date.now()}`;
+                  if (primaryArtistPickTarget === "release") {
+                    setMainArtistId(newId);
+                    setMainArtistName(n);
+                  } else {
+                    const pickTid = primaryArtistPickTarget;
+                    setTracks((ts) =>
+                      ts.map((x) =>
+                        x.id === pickTid
+                          ? {
+                              ...x,
+                              trackMainArtistId: newId,
+                              trackMainArtistName: n,
+                              trackHideReleasePrimary: false,
+                            }
+                          : x
+                      )
+                    );
+                  }
                   setCreateArtistOpen(false);
                   setArtistDialogOpen(false);
                   setNewArtistName("");
@@ -3056,6 +3925,7 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
               setAddContributorKind(null);
               setContributorOrgPicks([]);
               setContributorNameDraft("");
+              setContributorAddForTrackId(null);
             }
           }}
         >
@@ -3068,7 +3938,9 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
             )}
           >
             <DialogHeader className="shrink-0">
-              <DialogTitle>Add contributor</DialogTitle>
+              <DialogTitle>
+                {contributorAddForTrackId ? "Add contributor to this track" : "Add contributor"}
+              </DialogTitle>
               <DialogDescription>
                 {addContributorKind === "performer" &&
                   (organizationId
@@ -3373,7 +4245,10 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
               </Popover>
             )}
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setAddContributorKind(null)}>
+              <Button type="button" variant="outline" onClick={() => {
+                setAddContributorKind(null);
+                setContributorAddForTrackId(null);
+              }}>
                 Cancel
               </Button>
               <Button
@@ -3543,15 +4418,10 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                               {activeTrackAudio.file ? (
                                 <TrackLocalAudioPreview file={activeTrackAudio.file} />
                               ) : activeTrackAudio.remoteUrl ? (
-                                <audio
-                                  key={activeTrackAudio.remoteUrl}
-                                  controls
-                                  preload="metadata"
-                                  className="mt-3 h-9 w-full max-w-md rounded-md"
-                                  src={activeTrackAudio.remoteUrl}
-                                >
-                                  Your browser does not support audio preview.
-                                </audio>
+                                <TrackRemoteAudioPreview
+                                  initialUrl={activeTrackAudio.remoteUrl}
+                                  serverTrackId={activeTrack.serverTrackId}
+                                />
                               ) : null}
                             </div>
                             <div className="flex shrink-0 flex-col gap-1 sm:flex-row sm:items-start">
@@ -3620,6 +4490,315 @@ export function CreateReleaseWorkspace({ editReleaseId = null, onEditConsumed }:
                     }}
                   />
                 </div>
+
+                <div>
+                  <Label htmlFor={`track-isrc-${activeTrack.id}`}>
+                    ISRC{" "}
+                    <span className="font-normal text-muted-foreground">(optional)</span>
+                  </Label>
+                  <Input
+                    id={`track-isrc-${activeTrack.id}`}
+                    placeholder="e.g. USRC17607839"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={activeTrack.isrc ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setTracks((ts) =>
+                        ts.map((x) => (x.id === activeTrack.id ? { ...x, isrc: v } : x))
+                      );
+                      markDirty();
+                    }}
+                  />
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Optional. Empty means no ISRC on create; when saving an existing track, empty
+                    clears ISRC.
+                  </p>
+                </div>
+
+                <div className="space-y-3 border-t border-border/60 pt-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-sm font-medium text-foreground">Contributors</p>
+                    {contributors.length > 0 || mainArtistName.trim() ? (
+                      <span className="text-[11px] text-muted-foreground">
+                        Release contributors sync here. Use × on a row to hide it on this track only.
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Label className="text-base">Primary artist *</Label>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setPrimaryArtistPickTarget(activeTrack.id);
+                          setArtistDialogOpen(true);
+                        }}
+                      >
+                        <Plus className="h-4 w-4 mr-1" />
+                        {activeTrack.trackMainArtistName.trim()
+                          ? "Change primary artist"
+                          : effectiveTrackPrimary.name
+                            ? "Replace primary artist"
+                            : "Add primary artist"}
+                      </Button>
+                      {/**
+                       * "Show release primary" — reappears only when the user × the inherited
+                       * release primary AND has not picked a track-specific override. Clicking it
+                       * clears the hide flag so the release primary flows back in.
+                       */}
+                      {activeTrack.trackHideReleasePrimary && !activeTrack.trackMainArtistName.trim() && mainArtistName.trim() && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+                          onClick={() => {
+                            setTracks((ts) =>
+                              ts.map((x) =>
+                                x.id === activeTrack.id
+                                  ? { ...x, trackHideReleasePrimary: false }
+                                  : x
+                              )
+                            );
+                            markDirty();
+                          }}
+                        >
+                          Show release primary
+                        </Button>
+                      )}
+                    </div>
+                    {effectiveTrackPrimary.name ? (
+                      <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <Badge variant="secondary">{effectiveTrackPrimary.name}</Badge>
+                        {effectiveTrackPrimary.inherited && (
+                          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                            From release
+                          </span>
+                        )}
+                        {/**
+                         * Close (×) on the Primary artist row:
+                         *  - Inherited → set `trackHideReleasePrimary` so this track no longer
+                         *    inherits the release primary (release itself is untouched).
+                         *  - Track-specific → clear the track override so the release primary
+                         *    flows back in.
+                         */}
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 shrink-0"
+                          aria-label={
+                            effectiveTrackPrimary.inherited
+                              ? `Hide ${effectiveTrackPrimary.name} on this track`
+                              : `Remove ${effectiveTrackPrimary.name}`
+                          }
+                          onClick={() => {
+                            setTracks((ts) =>
+                              ts.map((x) => {
+                                if (x.id !== activeTrack.id) return x;
+                                if (effectiveTrackPrimary.inherited) {
+                                  return { ...x, trackHideReleasePrimary: true };
+                                }
+                                return {
+                                  ...x,
+                                  trackMainArtistName: "",
+                                  trackMainArtistId: null,
+                                };
+                              })
+                            );
+                            markDirty();
+                          }}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">No artist linked yet.</p>
+                    )}
+                  </div>
+
+                  {(() => {
+                    /**
+                     * Group the inherited + own contributor list by kind. Inherited rows carry
+                     * `releaseContributorId` so × adds that id to `trackHiddenReleaseContributorIds`.
+                     */
+                    const featuringRows = activeTrackContributorView.filter((v) =>
+                      isFeaturingWithRemixerContributor(v.row)
+                    );
+                    const performerRows = activeTrackContributorView.filter((v) => v.row.kind === "performer");
+                    const creditRows = activeTrackContributorView.filter((v) => v.row.kind === "credit");
+                    const renderRow = (v: TrackContributorView) => (
+                      <div key={v.row.id} className="flex items-center gap-2 text-sm">
+                        <Badge variant="secondary">{v.row.name}</Badge>
+                        <span className="text-xs text-muted-foreground">{contributorRowCaption(v.row)}</span>
+                        {v.inherited ? (
+                          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                            From release
+                          </span>
+                        ) : null}
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 shrink-0"
+                          aria-label={
+                            v.inherited
+                              ? `Hide ${v.row.name} on this track`
+                              : `Remove ${v.row.name}`
+                          }
+                          onClick={() => {
+                            /**
+                             * Single × should remove the row from **both** possible sources so it
+                             * truly disappears from the track UI (and therefore from the API
+                             * payload):
+                             *   1. If inherited, mark its release id as hidden for this track AND
+                             *      drop any track-only row matching this name+API role.
+                             *   2. If track-only, drop it from `trackContributors` AND hide any
+                             *      release row matching this name+API role for this track.
+                             */
+                            const targetName = v.row.name.trim().toLowerCase();
+                            const targetRole = contributorRowToApiRole(v.row).toLowerCase();
+                            const matches = (c: ContributorRow): boolean =>
+                              c.name.trim().toLowerCase() === targetName &&
+                              contributorRowToApiRole(c).toLowerCase() === targetRole;
+
+                            setTracks((ts) =>
+                              ts.map((x) => {
+                                if (x.id !== activeTrack.id) return x;
+                                let nextHidden = x.trackHiddenReleaseContributorIds;
+                                let nextOwn = x.trackContributors;
+
+                                if (v.inherited && v.releaseContributorId) {
+                                  const rid = v.releaseContributorId;
+                                  if (!nextHidden.includes(rid)) {
+                                    nextHidden = [...nextHidden, rid];
+                                  }
+                                } else {
+                                  nextOwn = nextOwn.filter((y) => y.id !== v.row.id);
+                                }
+
+                                /** Drop matching track-only duplicates regardless of which path ran. */
+                                nextOwn = nextOwn.filter((y) => !matches(y));
+
+                                /** Hide any matching release contributor that isn't already hidden. */
+                                const extraHides = contributors
+                                  .filter((c) => matches(c) && !nextHidden.includes(c.id))
+                                  .map((c) => c.id);
+                                if (extraHides.length > 0) {
+                                  nextHidden = [...nextHidden, ...extraHides];
+                                }
+
+                                if (
+                                  nextHidden === x.trackHiddenReleaseContributorIds &&
+                                  nextOwn === x.trackContributors
+                                ) {
+                                  return x;
+                                }
+                                return {
+                                  ...x,
+                                  trackHiddenReleaseContributorIds: nextHidden,
+                                  trackContributors: nextOwn,
+                                };
+                              })
+                            );
+                            markDirty();
+                          }}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    );
+
+                    return (
+                      <div className="space-y-4">
+                        <Label>Additional artists</Label>
+
+                        <div className="space-y-2 rounded-lg border border-border/50 bg-muted/15 p-3">
+                          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                            Featuring, With, Remixer
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => addContributor("featuring", activeTrack.id)}
+                            >
+                              + Add artist (Featuring)
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => addContributor("with", activeTrack.id)}
+                            >
+                              + Add artist (With)
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => addContributor("remixer", activeTrack.id)}
+                            >
+                              + Add artist (Remixer)
+                            </Button>
+                          </div>
+                          {featuringRows.length > 0 ? (
+                            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-1">
+                              {featuringRows.map(renderRow)}
+                            </div>
+                          ) : null}
+                        </div>
+
+                        <div className="space-y-2 rounded-lg border border-border/50 bg-muted/15 p-3">
+                          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                            Performers
+                          </p>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => addContributor("performer", activeTrack.id)}
+                          >
+                            + Add performer
+                          </Button>
+                          {performerRows.length > 0 ? (
+                            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-1">
+                              {performerRows.map(renderRow)}
+                            </div>
+                          ) : null}
+                        </div>
+
+                        <div className="space-y-2 rounded-lg border border-border/50 bg-muted/15 p-3">
+                          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                            Credits
+                          </p>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => addContributor("credit", activeTrack.id)}
+                          >
+                            + Add credit
+                          </Button>
+                          {creditRows.length > 0 ? (
+                            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-1">
+                              {creditRows.map(renderRow)}
+                            </div>
+                          ) : null}
+                        </div>
+
+                        {activeTrackContributorView.length === 0 ? (
+                          <p className="text-sm text-muted-foreground">No additional artists yet.</p>
+                        ) : null}
+                      </div>
+                    );
+                  })()}
+                </div>
+
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <Label>Primary genre *</Label>

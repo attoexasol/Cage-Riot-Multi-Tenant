@@ -12,6 +12,18 @@ export interface ReleaseContributorApi {
   user_id?: number;
 }
 
+/**
+ * One writer/publisher row for POST/PUT `/api/releases` `writers` array (matches Postman JSON create).
+ */
+export interface ReleaseWriterApi {
+  name: string;
+  role: string;
+  ownership_percentage: number;
+  iswc: string;
+  publishing_type: "copyright_control" | "published";
+  user_id?: number;
+}
+
 /** Server identifier for a contributor pivot row (`release_contributors.id`). */
 export type ContributorPivotId = string;
 
@@ -30,6 +42,8 @@ export interface CreateReleaseMultipartPayload {
   artworkFile?: File | null;
   /** Top-level JSON array on create (user_id optional when not from org roster). */
   contributors?: ReleaseContributorApi[];
+  /** Writer / publisher splits (Publishing section). Sent as JSON array on create/update. */
+  writers?: ReleaseWriterApi[];
   /**
    * Pivot ids (`release_contributors.id`) the user removed during this edit session — sent so the
    * Laravel side can detach those rows in the same PUT call that adds/updates `contributors`.
@@ -102,6 +116,21 @@ export function buildUpdateReleaseJsonBody(payload: UpdateReleaseJsonPayload): R
       body.deleted_contributor_ids = cleaned;
     }
   }
+  if (payload.writers && payload.writers.length > 0) {
+    body.writers = payload.writers.map((w) => {
+      const row: Record<string, unknown> = {
+        name: w.name,
+        role: w.role,
+        ownership_percentage: w.ownership_percentage,
+        iswc: w.iswc ?? "",
+        publishing_type: w.publishing_type,
+      };
+      if (w.user_id != null && Number.isFinite(w.user_id)) {
+        row.user_id = w.user_id;
+      }
+      return row;
+    });
+  }
   const putPg = normalizeGenreFieldForApi(payload.primary_genre);
   if (putPg) {
     body.primary_genre = putPg;
@@ -171,6 +200,26 @@ export function buildReleaseFormData(payload: CreateReleaseMultipartPayload): Fo
     if (cleaned.length > 0) {
       fd.append("deleted_contributor_ids", JSON.stringify(cleaned));
     }
+  }
+  if (payload.writers && payload.writers.length > 0) {
+    fd.append(
+      "writers",
+      JSON.stringify(
+        payload.writers.map((w) => {
+          const row: Record<string, unknown> = {
+            name: w.name,
+            role: w.role,
+            ownership_percentage: w.ownership_percentage,
+            iswc: w.iswc ?? "",
+            publishing_type: w.publishing_type,
+          };
+          if (w.user_id != null && Number.isFinite(w.user_id)) {
+            row.user_id = w.user_id;
+          }
+          return row;
+        })
+      )
+    );
   }
   const fdPg = normalizeGenreFieldForApi(payload.primary_genre);
   if (fdPg) {
@@ -835,6 +884,7 @@ export interface CreateReleaseJsonPayload {
   scheduled_release_date?: string;
   primary_genre?: string;
   secondary_genre?: string | null;
+  writers?: ReleaseWriterApi[];
 }
 
 /**
@@ -912,6 +962,21 @@ export function buildCreateReleaseJsonBody(payload: CreateReleaseJsonPayload): R
   const jsonSg = normalizeGenreFieldForApi(payload.secondary_genre ?? undefined);
   if (jsonSg) {
     body.secondary_genre = jsonSg;
+  }
+  if (payload.writers && payload.writers.length > 0) {
+    body.writers = payload.writers.map((w) => {
+      const row: Record<string, unknown> = {
+        name: w.name,
+        role: w.role,
+        ownership_percentage: w.ownership_percentage,
+        iswc: w.iswc ?? "",
+        publishing_type: w.publishing_type,
+      };
+      if (w.user_id != null && Number.isFinite(w.user_id)) {
+        row.user_id = w.user_id;
+      }
+      return row;
+    });
   }
   return body;
 }
@@ -1256,6 +1321,13 @@ export type CreateTrackJsonPayload = {
   audio_file_size: number;
   copyright_year: number;
   copyright_owner: string;
+  /** When set, included in the JSON create body (matches Postman). */
+  isrc?: string | null;
+  /**
+   * Track contributors — same shape as release `contributors`. Primary row should be first.
+   * Send a non-empty array from the UI; an empty array is omitted from the HTTP body.
+   */
+  contributors?: ReleaseContributorApi[];
 } & Partial<{
   sample_license_file_path: string;
   sample_license_file_name: string;
@@ -1548,11 +1620,27 @@ export async function createReleaseTrackJson(
     copyright_year: payload.copyright_year,
     copyright_owner: payload.copyright_owner,
   };
+  const isrcTrim = typeof payload.isrc === "string" ? payload.isrc.trim() : "";
+  if (isrcTrim) {
+    body.isrc = isrcTrim;
+  }
   if (payload.sample_license_file_path != null && payload.sample_license_file_path !== "") {
     body.sample_license_file_path = payload.sample_license_file_path;
     body.sample_license_file_name = payload.sample_license_file_name;
     body.sample_license_mime_type = payload.sample_license_mime_type;
     body.sample_license_file_size = payload.sample_license_file_size;
+  }
+  /**
+   * Always serialize when the payload carries a non-empty list (UI assigns
+   * `payload.contributors` on every create so this is reliable).
+   */
+  const contributorList = Array.isArray(payload.contributors) ? payload.contributors : [];
+  if (contributorList.length > 0) {
+    body.contributors = contributorList.map((c) => {
+      const row: Record<string, unknown> = { name: c.name, role: c.role };
+      if (c.user_id != null && Number.isFinite(c.user_id)) row.user_id = c.user_id;
+      return row;
+    });
   }
   let token = await getValidAccessToken();
   let response = await doCreateReleaseTrackJson(token, rid, body);
@@ -1642,6 +1730,12 @@ export interface UpdateTrackJsonPayload {
   copyright_year?: number | null;
   copyright_owner?: string | null;
   isrc?: string | null;
+  /**
+   * Track contributors — same shape as release `contributors`. When provided (even an empty
+   * array), the API replaces the track's contributor list. Omit (`undefined`) to leave it
+   * untouched on a partial update.
+   */
+  contributors?: ReleaseContributorApi[];
 }
 
 function buildUpdateTrackJsonBody(payload: UpdateTrackJsonPayload): Record<string, unknown> {
@@ -1684,6 +1778,15 @@ function buildUpdateTrackJsonBody(payload: UpdateTrackJsonPayload): Record<strin
   if (payload.track_properties !== undefined) {
     body.track_properties = Array.isArray(payload.track_properties)
       ? payload.track_properties.map((s) => String(s).trim()).filter((s) => s.length > 0)
+      : [];
+  }
+  if (payload.contributors !== undefined) {
+    body.contributors = Array.isArray(payload.contributors)
+      ? payload.contributors.map((c) => {
+          const row: Record<string, unknown> = { name: c.name, role: c.role };
+          if (c.user_id != null && Number.isFinite(c.user_id)) row.user_id = c.user_id;
+          return row;
+        })
       : [];
   }
   return body;
